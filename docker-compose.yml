@@ -1,0 +1,124 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/app/Dockerfile
+    container_name: sentinelpay_app
+    restart: unless-stopped
+    working_dir: /var/www
+    volumes:
+      - .:/var/www
+      - ./docker/app/php.ini:/usr/local/etc/php/conf.d/custom.ini
+    environment:
+      - APP_ENV=local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - sentinelpay
+
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: sentinelpay_nginx
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - .:/var/www
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - app
+    networks:
+      - sentinelpay
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: sentinelpay_postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-sentinelpay}
+      POSTGRES_USER: ${DB_USERNAME:-sentinelpay}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-sentinelpay} -d ${DB_DATABASE:-sentinelpay}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sentinelpay
+
+  redis:
+    image: redis:7-alpine
+    container_name: sentinelpay_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass ${REDIS_PASSWORD:-secret}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-secret}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sentinelpay
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: sentinelpay_rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-sentinelpay}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-secret}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-sentinelpay}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "status"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - sentinelpay
+
+  queue:
+    build:
+      context: .
+      dockerfile: docker/app/Dockerfile
+    container_name: sentinelpay_queue
+    restart: unless-stopped
+    working_dir: /var/www
+    command: php artisan queue:work rabbitmq --sleep=3 --tries=3 --max-time=3600
+    volumes:
+      - .:/var/www
+      - ./docker/app/php.ini:/usr/local/etc/php/conf.d/custom.ini
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - sentinelpay
+
+networks:
+  sentinelpay:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
