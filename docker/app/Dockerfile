@@ -1,6 +1,6 @@
 FROM php:8.3-fpm-alpine
 
-# Install system dependencies
+# Install system dependencies (postgresql-client needed for test entrypoint pg_isready/psql)
 RUN apk add --no-cache \
     libpq-dev \
     libzip-dev \
@@ -12,7 +12,8 @@ RUN apk add --no-cache \
     autoconf \
     g++ \
     make \
-    linux-headers
+    linux-headers \
+    postgresql-client
 
 # Install PHP extensions
 RUN docker-php-ext-install \
@@ -35,7 +36,8 @@ WORKDIR /var/www
 
 COPY . .
 
-RUN composer install --no-dev --optimize-autoloader --no-interaction
+# Install ALL deps (including --dev) so tests can run inside Docker
+RUN composer install --optimize-autoloader --no-interaction
 
 RUN chown -R www-data:www-data /var/www/storage /var/www/bootstrap/cache
 
