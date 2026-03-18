@@ -1,4 +1,4 @@
-FROM php:8.3-fpm-alpine
+FROM php:8.4-fpm-alpine
 
 # Install system dependencies (postgresql-client needed for test entrypoint pg_isready/psql)
 RUN apk add --no-cache \
@@ -24,7 +24,8 @@ RUN docker-php-ext-install \
     bcmath \
     zip \
     mbstring \
-    opcache
+    opcache \
+    sockets
 
 # Install Redis extension via PECL
 RUN pecl install redis && docker-php-ext-enable redis
