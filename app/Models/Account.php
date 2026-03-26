@@ -2,48 +2,50 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
-use Illuminate\Support\Str;
 
 class Account extends Model
 {
-    use HasFactory, \Illuminate\Database\Eloquent\Concerns\HasUuids;
-
-    protected $table = 'accounts';
+    use HasFactory;
+    use HasUuids;
 
     protected $fillable = [
-        'user_id',
+        'merchant_id',
+        'name',
         'balance',
         'currency',
         'is_active',
     ];
 
-    protected $casts = [
-        'balance' => 'decimal:2',
-        'is_active' => 'boolean',
-    ];
-
-    // Relationships
-
-    public function user(): \Illuminate\Database\Eloquent\Relations\BelongsTo
+    protected function casts(): array
     {
-        return $this->belongsTo(User::class);
+        return [
+            'balance' => 'decimal:2',
+            'is_active' => 'boolean',
+        ];
     }
 
-    public function sentTransactions(): HasMany
+    public function merchant(): BelongsTo
     {
-        return $this->hasMany(Transaction::class, 'sender_id');
+        return $this->belongsTo(Merchant::class);
     }
 
-    public function receivedTransactions(): HasMany
+    public function outgoingTransfers(): HasMany
     {
-        return $this->hasMany(Transaction::class, 'receiver_id');
+        return $this->hasMany(Transfer::class, 'source_account_id');
+    }
+
+    public function incomingTransfers(): HasMany
+    {
+        return $this->hasMany(Transfer::class, 'destination_account_id');
     }
 
     public function ledgerEntries(): HasMany
     {
-        return $this->hasMany(Ledger::class, 'account_id');
+        return $this->hasMany(LedgerEntry::class);
     }
 }

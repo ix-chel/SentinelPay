@@ -1,0 +1,69 @@
+{
+	"info": {
+		"name": "SentinelPay API",
+		"description": "API endpoints for SentinelPay MongoDB architecture.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Check Balances",
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer sp_live_demo1234567890"
+					}
+				],
+				"url": {
+					"raw": "http://localhost:8080/api/balances",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"api",
+						"balances"
+					]
+				}
+			}
+		},
+		{
+			"name": "Create Transfer",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "Bearer sp_live_demo1234567890"
+					},
+					{
+						"key": "Idempotency-Key",
+						"value": "{{$guid}}"
+					},
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"source_account_id\": \"<source_id_here>\",\n    \"destination_account_id\": \"<dest_id_here>\",\n    \"amount\": 150.50,\n    \"currency\": \"USD\"\n}"
+				},
+				"url": {
+					"raw": "http://localhost:8080/api/transfers",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8080",
+					"path": [
+						"api",
+						"transfers"
+					]
+				}
+			}
+		}
+	]
+}

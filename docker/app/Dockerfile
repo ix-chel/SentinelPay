@@ -13,7 +13,8 @@ RUN apk add --no-cache \
     g++ \
     make \
     linux-headers \
-    postgresql-client
+    postgresql-client \
+    openssl-dev
 
 # Install PHP extensions
 RUN docker-php-ext-install \
@@ -27,8 +28,12 @@ RUN docker-php-ext-install \
     opcache \
     sockets
 
-# Install Redis extension via PECL
-RUN pecl install redis && docker-php-ext-enable redis
+# Install Redis and MongoDB extensions via PECL
+RUN pecl install redis \
+    && docker-php-ext-enable redis \
+    && pecl uninstall mongodb || true \
+    && pecl install mongodb-1.21.0 \
+    && docker-php-ext-enable mongodb
 
 # Install Composer
 COPY --from=composer:2.7 /usr/bin/composer /usr/bin/composer

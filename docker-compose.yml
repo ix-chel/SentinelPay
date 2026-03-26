@@ -21,16 +21,15 @@ services:
     networks:
       - sentinelpay
 
-  # ── Dedicated test runner ──────────────────────────────────────────────────
-  # Usage: docker compose run --rm test
-  # Runs the full Pest suite against a dedicated sentinelpay_test database.
   test:
     build:
       context: .
       dockerfile: docker/app/Dockerfile
     container_name: sentinelpay_test
+    profiles:
+      - test
     working_dir: /var/www
-    entrypoint: [ "/bin/sh", "/var/www/docker/app/docker-entrypoint-test.sh" ]
+    entrypoint: ["/bin/sh", "/var/www/docker/app/docker-entrypoint-test.sh"]
     volumes:
       - .:/var/www
       - ./docker/app/php.ini:/usr/local/etc/php/conf.d/custom.ini
@@ -40,8 +39,8 @@ services:
       - DB_HOST=postgres
       - DB_PORT=5432
       - DB_DATABASE=sentinelpay_test
-      - DB_USERNAME=${DB_USERNAME:-sentinelpay}
-      - DB_PASSWORD=${DB_PASSWORD:-secret}
+      - DB_USERNAME=sentinelpay
+      - DB_PASSWORD=secret
       - CACHE_STORE=array
       - QUEUE_CONNECTION=sync
       - SESSION_DRIVER=array
@@ -55,7 +54,6 @@ services:
         condition: service_healthy
     networks:
       - sentinelpay
-  # ──────────────────────────────────────────────────────────────────────────
 
   nginx:
     image: nginx:1.25-alpine
@@ -72,19 +70,19 @@ services:
       - sentinelpay
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     container_name: sentinelpay_postgres
+    environment:
+      POSTGRES_DB: sentinelpay
+      POSTGRES_USER: sentinelpay
+      POSTGRES_PASSWORD: secret
     restart: unless-stopped
     ports:
       - "5432:5432"
-    environment:
-      POSTGRES_DB: ${DB_DATABASE:-sentinelpay}
-      POSTGRES_USER: ${DB_USERNAME:-sentinelpay}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${DB_USERNAME:-sentinelpay} -d ${DB_DATABASE:-sentinelpay}" ]
+      test: ["CMD-SHELL", "pg_isready -U sentinelpay -d sentinelpay"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -101,7 +99,7 @@ services:
     volumes:
       - redis_data:/data
     healthcheck:
-      test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-secret}", "ping" ]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-secret}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -122,7 +120,7 @@ services:
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
-      test: [ "CMD", "rabbitmq-diagnostics", "status" ]
+      test: ["CMD", "rabbitmq-diagnostics", "status"]
       interval: 15s
       timeout: 10s
       retries: 5

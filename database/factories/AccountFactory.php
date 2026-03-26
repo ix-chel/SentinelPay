@@ -2,17 +2,20 @@
 
 namespace Database\Factories;
 
-use App\Models\User;
+use App\Models\Merchant;
 use Illuminate\Database\Eloquent\Factories\Factory;
 
 class AccountFactory extends Factory
 {
+    protected $model = \App\Models\Account::class;
+
     public function definition(): array
     {
         return [
-            'user_id'   => User::factory(),
-            'balance'   => $this->faker->randomFloat(2, 100, 100000),
-            'currency'  => 'USD',
+            'merchant_id' => Merchant::factory(),
+            'name' => $this->faker->words(3, true),
+            'balance' => $this->faker->randomFloat(2, 100, 100000),
+            'currency' => 'USD',
             'is_active' => true,
         ];
     }
