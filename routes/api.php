@@ -3,8 +3,9 @@
 use App\Http\Controllers\Api\ApiKeyController;
 use App\Http\Controllers\Api\MerchantController;
 use App\Http\Controllers\Api\TransferController;
+use App\Http\Controllers\Api\WebhookController;
 use App\Http\Middleware\VerifyApiKey;
-use Illuminate\Support\Facades\Route; // Need to create/modify this later
+use Illuminate\Support\Facades\Route;
 
 Route::prefix('v1')->group(function () {
     Route::get('/health', fn () => response()->json(['status' => 'ok']));
@@ -19,15 +20,14 @@ Route::prefix('v1')->group(function () {
         Route::delete('/keys/{id}', [ApiKeyController::class, 'destroy']);
 
         // Transfers
-        // Optional HMAC signature check can be applied to specific routes
-        Route::post('/transfers', [TransferController::class, 'transfer']);
+        Route::post('/transfers', [TransferController::class, 'transfer'])->middleware('hmac');
         Route::get('/transfers/{id}', [TransferController::class, 'show']);
         Route::get('/balances', [TransferController::class, 'balance']);
         Route::get('/ledger/{accountId}', [TransferController::class, 'ledger']);
 
         // Webhooks
-        Route::get('/webhooks', [\App\Http\Controllers\Api\WebhookController::class, 'index']);
-        Route::post('/webhooks', [\App\Http\Controllers\Api\WebhookController::class, 'store']);
-        Route::delete('/webhooks/{id}', [\App\Http\Controllers\Api\WebhookController::class, 'destroy']);
+        Route::get('/webhooks', [WebhookController::class, 'index']);
+        Route::post('/webhooks', [WebhookController::class, 'store']);
+        Route::delete('/webhooks/{id}', [WebhookController::class, 'destroy']);
     });
 });

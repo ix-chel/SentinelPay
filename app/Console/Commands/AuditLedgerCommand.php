@@ -10,22 +10,22 @@ class AuditLedgerCommand extends Command
 {
     protected $signature = 'audit:ledger
                             {--account= : Audit a specific account by ID}
-                            {--fix      : Reconcile drifted account balances to match the ledger (ledger is source of truth)}
+                            {--fix      : Reconcile drifted account balances to match the latest ledger balance}
                             {--force    : Skip the confirmation prompt when --fix is used}';
 
-    protected $description = 'Verify that ledger entry sums match each account\'s current balance (financial integrity check)';
+    protected $description = 'Verify that account balances match the latest append-only ledger balance';
 
     public function handle(): int
     {
-        $this->info('╔══════════════════════════════════════════════╗');
-        $this->info('║          SentinelPay Ledger Audit            ║');
-        $this->info('╚══════════════════════════════════════════════╝');
+        $this->info('==============================================');
+        $this->info('           SentinelPay Ledger Audit           ');
+        $this->info('==============================================');
         $this->newLine();
 
         $query = Account::query();
 
         if ($accountId = $this->option('account')) {
-            $query->where('_id', $accountId);
+            $query->whereKey($accountId);
         }
 
         $accounts = $query->get();
@@ -41,12 +41,13 @@ class AuditLedgerCommand extends Command
 
         $passed = 0;
         $failed = 0;
+        $skipped = 0;
         $discrepancies = [];
 
         $headers = [
             'Account ID',
             'Account Balance',
-            'Net Ledger Sum',
+            'Latest Ledger Balance',
             'Debit Sum',
             'Credit Sum',
             'Status',
@@ -54,35 +55,47 @@ class AuditLedgerCommand extends Command
         $rows = [];
 
         foreach ($accounts as $account) {
-            $totals = $this->getLedgerSums($account->id);
+            $summary = $this->getLedgerSummary((string) $account->id);
+            $accountBalance = bcadd((string) ($account->balance ?? 0), '0', 2);
 
-            $totalCredits = bcadd((string) ($totals['total_credits'] ?? '0'), '0', 2);
-            $totalDebits = bcadd((string) ($totals['total_debits'] ?? '0'), '0', 2);
-            $netLedger = bcsub($totalCredits, $totalDebits, 2);
-            $accountBal = bcadd((string) ($account->balance ?? 0), '0', 2);
+            if ($summary['entry_count'] === 0) {
+                $skipped++;
 
-            $isBalanced = bccomp($netLedger, $accountBal, 2) === 0;
+                $rows[] = [
+                    substr((string) $account->id, 0, 8).'...',
+                    $accountBalance,
+                    'N/A',
+                    '0.00',
+                    '0.00',
+                    '<fg=yellow>SKIP</>',
+                ];
+
+                continue;
+            }
+
+            $latestLedgerBalance = $summary['latest_balance_after'];
+            $isBalanced = bccomp($latestLedgerBalance, $accountBalance, 2) === 0;
 
             if ($isBalanced) {
                 $passed++;
-                $statusLabel = '<fg=green>✓ PASS</>';
+                $statusLabel = '<fg=green>PASS</>';
             } else {
                 $failed++;
-                $statusLabel = '<fg=red>✗ FAIL</>';
+                $statusLabel = '<fg=red>FAIL</>';
                 $discrepancies[] = [
                     'account_id' => (string) $account->id,
-                    'account_balance' => $accountBal,
-                    'ledger_net' => $netLedger,
-                    'difference' => bcsub($accountBal, $netLedger, 2),
+                    'account_balance' => $accountBalance,
+                    'ledger_balance' => $latestLedgerBalance,
+                    'difference' => bcsub($accountBalance, $latestLedgerBalance, 2),
                 ];
             }
 
             $rows[] = [
                 substr((string) $account->id, 0, 8).'...',
-                $accountBal,
-                $netLedger,
-                $totalDebits,
-                $totalCredits,
+                $accountBalance,
+                $latestLedgerBalance,
+                $summary['total_debits'],
+                $summary['total_credits'],
                 $statusLabel,
             ];
         }
@@ -92,27 +105,28 @@ class AuditLedgerCommand extends Command
 
         $this->line(sprintf('<fg=green>Passed: %d</>', $passed));
         $this->line(sprintf('<fg=red>Failed: %d</>', $failed));
+        $this->line(sprintf('<fg=yellow>Skipped: %d</>', $skipped));
         $this->newLine();
 
         if (empty($discrepancies)) {
-            $this->info('✅ All accounts passed financial integrity check. Ledger is consistent.');
+            $this->info('Ledger audit completed without drift.');
 
             return self::SUCCESS;
         }
 
-        $this->error('═══ DISCREPANCIES DETECTED ═══');
+        $this->error('=== DISCREPANCIES DETECTED ===');
         $this->newLine();
 
-        foreach ($discrepancies as $d) {
-            $sign = bccomp($d['difference'], '0', 2) >= 0 ? '+' : '';
+        foreach ($discrepancies as $discrepancy) {
+            $sign = bccomp($discrepancy['difference'], '0', 2) >= 0 ? '+' : '';
             $this->error(
                 sprintf(
-                    'Account %s │ account_balance=%s │ ledger_net=%s │ drift=%s%s',
-                    $d['account_id'],
-                    $d['account_balance'],
-                    $d['ledger_net'],
+                    'Account %s | account_balance=%s | ledger_balance=%s | drift=%s%s',
+                    $discrepancy['account_id'],
+                    $discrepancy['account_balance'],
+                    $discrepancy['ledger_balance'],
                     $sign,
-                    $d['difference'],
+                    $discrepancy['difference'],
                 ),
             );
         }
@@ -120,22 +134,22 @@ class AuditLedgerCommand extends Command
         $this->newLine();
 
         if (! $this->option('fix')) {
-            $this->warn('⚠️  Financial integrity check FAILED. Re-run with --fix to reconcile balances.');
+            $this->warn('Ledger audit failed. Re-run with --fix to reconcile balances.');
 
             return self::FAILURE;
         }
 
-        $this->warn('The ledger is the source of truth. The following account balances will be');
-        $this->warn('overwritten to match their net ledger sum:');
+        $this->warn('The latest ledger balance is the source of truth. The following account balances will be');
+        $this->warn('overwritten to match the latest ledger entry balance:');
         $this->newLine();
 
-        foreach ($discrepancies as $d) {
+        foreach ($discrepancies as $discrepancy) {
             $this->line(
                 sprintf(
-                    '  • <fg=yellow>%s</>  %s  →  <fg=cyan>%s</>',
-                    $d['account_id'],
-                    $d['account_balance'],
-                    $d['ledger_net'],
+                    '  - <fg=yellow>%s</>  %s  ->  <fg=cyan>%s</>',
+                    $discrepancy['account_id'],
+                    $discrepancy['account_balance'],
+                    $discrepancy['ledger_balance'],
                 ),
             );
         }
@@ -151,40 +165,27 @@ class AuditLedgerCommand extends Command
         $corrected = 0;
         $errors = 0;
 
-        foreach ($discrepancies as $d) {
+        foreach ($discrepancies as $discrepancy) {
             try {
-                $account = Account::findOrFail($d['account_id']);
+                $account = Account::findOrFail($discrepancy['account_id']);
+                $freshSummary = $this->getLedgerSummary((string) $account->id);
 
-                $freshTotals = $this->getLedgerSums($account->id);
-                $totalCredits = bcadd((string) ($freshTotals['total_credits'] ?? '0'), '0', 2);
-                $totalDebits = bcadd((string) ($freshTotals['total_debits'] ?? '0'), '0', 2);
-                $freshLedgerNet = bcsub($totalCredits, $totalDebits, 2);
-
-                if (bccomp($freshLedgerNet, bcadd((string) ($account->balance ?? 0), '0', 2), 2) === 0) {
+                if ($freshSummary['entry_count'] === 0) {
                     continue;
                 }
 
-                $account->balance = (float) $freshLedgerNet;
-                $account->save();
+                $freshLedgerBalance = $freshSummary['latest_balance_after'];
 
-                $this->info(
-                    sprintf(
-                        '  ✓ Fixed account %s  (balance set to %s)',
-                        $d['account_id'],
-                        $d['ledger_net'],
-                    ),
-                );
+                if (bccomp($freshLedgerBalance, bcadd((string) ($account->balance ?? 0), '0', 2), 2) === 0) {
+                    continue;
+                }
 
+                $account->forceFill(['balance' => $freshLedgerBalance])->save();
+
+                $this->info(sprintf('  Fixed account %s (balance set to %s)', $discrepancy['account_id'], $freshLedgerBalance));
                 $corrected++;
-            } catch (\Throwable $e) {
-                $this->error(
-                    sprintf(
-                        '  ✗ Failed to fix account %s: %s',
-                        $d['account_id'],
-                        $e->getMessage(),
-                    ),
-                );
-
+            } catch (\Throwable $exception) {
+                $this->error(sprintf('  Failed to fix account %s: %s', $discrepancy['account_id'], $exception->getMessage()));
                 $errors++;
             }
         }
@@ -195,37 +196,40 @@ class AuditLedgerCommand extends Command
         $this->newLine();
 
         if ($errors > 0) {
-            $this->warn('⚠️  Some accounts could not be reconciled. Investigate the errors above.');
+            $this->warn('Some accounts could not be reconciled. Investigate the errors above.');
 
             return self::FAILURE;
         }
 
-        $this->info('✅ All discrepancies reconciled. Ledger and account balances are now consistent.');
+        $this->info('All discrepancies reconciled. Ledger and account balances are now consistent.');
 
         return self::SUCCESS;
     }
 
-    private function getLedgerSums($accountId)
+    /**
+     * @return array{entry_count: int, latest_balance_after: string|null, total_credits: string, total_debits: string}
+     */
+    private function getLedgerSummary(string $accountId): array
     {
-        $pipeline = [
-            ['$match' => ['account_id' => $accountId]],
-            ['$group' => [
-                '_id' => null,
-                'total_credits' => ['$sum' => ['$cond' => [['$eq' => ['$type', 'credit']], '$amount', 0]]],
-                'total_debits' => ['$sum' => ['$cond' => [['$eq' => ['$type', 'debit']], '$amount', 0]]],
-            ]],
-        ];
+        $totals = LedgerEntry::query()
+            ->where('account_id', $accountId)
+            ->selectRaw(
+                'COUNT(*) as entry_count, COALESCE(SUM(CASE WHEN type = ? THEN amount ELSE 0 END), 0) as total_credits, COALESCE(SUM(CASE WHEN type = ? THEN amount ELSE 0 END), 0) as total_debits',
+                [LedgerEntry::TYPE_CREDIT, LedgerEntry::TYPE_DEBIT],
+            )
+            ->first();
 
-        $results = LedgerEntry::raw(function ($collection) use ($pipeline) {
-            return $collection->aggregate($pipeline);
-        });
-
-        $resultsArray = is_array($results) ? $results : iterator_to_array($results);
-        $totals = ! empty($resultsArray) ? (array) $resultsArray[0] : null;
+        $latestBalance = LedgerEntry::query()
+            ->where('account_id', $accountId)
+            ->orderByDesc('created_at')
+            ->orderByDesc('id')
+            ->value('balance_after');
 
         return [
-            'total_credits' => $totals['total_credits'] ?? 0,
-            'total_debits' => $totals['total_debits'] ?? 0,
+            'entry_count' => (int) ($totals?->entry_count ?? 0),
+            'latest_balance_after' => $latestBalance === null ? null : bcadd((string) $latestBalance, '0', 2),
+            'total_credits' => bcadd((string) ($totals?->total_credits ?? '0'), '0', 2),
+            'total_debits' => bcadd((string) ($totals?->total_debits ?? '0'), '0', 2),
         ];
     }
 }

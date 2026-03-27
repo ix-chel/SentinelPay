@@ -3,6 +3,7 @@ param(
     [string]$ApiKey = 'sp_live_demo1234567890',
     [decimal]$Amount = 25.00,
     [string]$Currency = 'USD',
+    [string]$HmacSecret = 'your-super-secret-hmac-key-change-in-production',
     [string]$WebhookUrl = ''
 )
 
@@ -16,6 +17,20 @@ function Write-Step {
 function Write-Json {
     param($Value)
     $Value | ConvertTo-Json -Depth 10
+}
+
+function New-Signature {
+    param([string]$Body)
+
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new([System.Text.Encoding]::UTF8.GetBytes($HmacSecret))
+
+    try {
+        $hashBytes = $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Body))
+    } finally {
+        $hmac.Dispose()
+    }
+
+    return ([System.BitConverter]::ToString($hashBytes)).Replace('-', '').ToLowerInvariant()
 }
 
 $headers = @{
@@ -38,18 +53,19 @@ $sourceAccount = $balances.accounts[0]
 $destinationAccount = $balances.accounts[1]
 $idempotencyKey = "demo-transfer-$([guid]::NewGuid().ToString())"
 
-$transferHeaders = @{
-    'X-API-Key' = $ApiKey
-    'Idempotency-Key' = $idempotencyKey
-    'Content-Type' = 'application/json'
-}
-
 $transferBody = @{
     source_account_id = $sourceAccount.id
     destination_account_id = $destinationAccount.id
     amount = '{0:F2}' -f $Amount
     currency = $Currency.ToUpperInvariant()
 } | ConvertTo-Json
+
+$transferHeaders = @{
+    'X-API-Key' = $ApiKey
+    'Idempotency-Key' = $idempotencyKey
+    'Content-Type' = 'application/json'
+    'X-Signature' = New-Signature -Body $transferBody
+}
 
 Write-Step "Creating transfer"
 $transferResponse = Invoke-RestMethod -Uri "$BaseUrl/transfers" -Method Post -Headers $transferHeaders -Body $transferBody

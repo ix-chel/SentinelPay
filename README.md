@@ -8,7 +8,7 @@ SentinelPay is a payment API built with **Laravel 12**, **PostgreSQL**, **Redis*
 Transfers are executed inside a PostgreSQL transaction and use row-level locks on both accounts.
 - Concurrent debits are serialized with `SELECT ... FOR UPDATE`.
 - Each successful transfer writes paired debit and credit ledger entries.
-- The `audit:ledger` command verifies that account balances match ledger totals.
+- The `audit:ledger` command verifies that account balances match the latest recorded ledger balance.
 
 ### 2. Idempotency & Fault Tolerance
 The `POST /api/v1/transfers` endpoint enforces idempotency using the `Idempotency-Key` header.
@@ -18,7 +18,8 @@ The `POST /api/v1/transfers` endpoint enforces idempotency using the `Idempotenc
 ### 3. API Key Management & Security
 - **Hashed Storage**: API keys are generated as cryptographically secure strings and safely stored via SHA-256 hashes.
 - **Scoping & Rate Limiting**: Keys can be restricted to specific endpoints and are rate-limited per minute.
-- **Request Signing (HMAC)**: Webhook deliveries to merchants are signed (`Stripe-Signature` style) using HMAC-SHA256 to allow merchants to verify payload authenticity.
+- **Signed Transfer Requests**: `POST /api/v1/transfers` requires an `X-Signature` HMAC-SHA256 header over the raw JSON body.
+- **Signed Webhook Deliveries**: Webhook deliveries use a `Stripe-Signature` style HMAC so merchants can verify payload authenticity.
 
 ### 4. Webhook Eventing
 - Async delivery of events (e.g., `transfer.succeeded`) to registered merchant endpoints.
@@ -60,7 +61,7 @@ The `POST /api/v1/transfers` endpoint enforces idempotency using the `Idempotenc
    Navigate to `http://localhost:8080/dashboard` in your browser to view the seeded merchant, API key, transfers, and webhook logs.
 
 5. **Test the API**
-   Use the seeded API key `sp_live_demo1234567890` against `http://localhost:8080/api/v1/...`.
+   Use the seeded API key `sp_live_demo1234567890` and sign transfer payloads with `HMAC_SECRET` against `http://localhost:8080/api/v1/...`.
 
 ## Running Tests & Audits
 Run the Pest/PHPUnit test suite:
@@ -70,7 +71,7 @@ docker compose exec app php artisan test
 
 Run the Ledger Audit tool to perform a financial integrity check:
 ```bash
-php artisan audit:ledger
+docker compose exec app php artisan audit:ledger
 ```
 
 ## Useful Links
