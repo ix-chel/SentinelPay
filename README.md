@@ -74,22 +74,6 @@ Run the Ledger Audit tool to perform a financial integrity check:
 docker compose exec app php artisan audit:ledger
 ```
 
-## Measured Performance Ceiling
-These numbers are from a local Docker Desktop run on the current development machine, not from a production environment.
-
-The benchmark targeted the worst-case path: repeated `POST /api/v1/transfers` requests against the same source and destination account pair, with unique idempotency keys, which maximizes row-lock contention on PostgreSQL.
-
-- The transfer path saturated at roughly `48-50 RPS`.
-- Up to `320` concurrent requests in this hot-row scenario, all requests still completed with `201 Created`.
-- At `1000` concurrent requests over `1000` total requests, the system began to fail:
-  - `960` requests returned `201 Created`
-  - `40` requests timed out on the client side
-  - measured throughput was `49.83 RPS`
-  - `p50` latency was `10.88s`
-  - `p95` latency was `19.76s`
-
-This means the current architecture is credible for a serious portfolio backend and correctness-focused concurrency handling, but it is not positioned as high-scale payment infrastructure.
-
 ## Useful Links
 - **API Reference**: `http://localhost:8080/docs/api`
 - **Postman Collection**: Locate the JSON export in the `docs/` folder.
