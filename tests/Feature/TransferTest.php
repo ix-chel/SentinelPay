@@ -5,6 +5,7 @@ use App\Models\ApiKey;
 use App\Models\LedgerEntry;
 use App\Models\Merchant;
 use App\Models\Transfer;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
 
 function createMerchantContext(): array
@@ -34,6 +35,11 @@ function signedTransferHeaders(string $plainTextKey, array $payload, string $ide
         'Idempotency-Key' => $idempotencyKey,
         'X-Signature' => signTransferPayload($payload),
     ];
+}
+
+function idempotencyLockKey(string $merchantId, string $idempotencyKey): string
+{
+    return "transfer-lock:{$merchantId}:{$idempotencyKey}";
 }
 
 describe('transfer API', function () {
@@ -155,5 +161,31 @@ describe('transfer API', function () {
             'currency' => 'USD',
         ])->assertStatus(401)
             ->assertJsonPath('error', 'Missing X-Signature header.');
+    });
+
+    it('returns 409 while the same idempotency key is already being processed', function () {
+        [$merchant, $plainTextKey] = createMerchantContext();
+
+        $sender = Account::factory()->for($merchant)->withBalance('1000.00')->create(['currency' => 'USD']);
+        $receiver = Account::factory()->for($merchant)->withBalance('0.00')->create(['currency' => 'USD']);
+
+        $payload = [
+            'source_account_id' => $sender->id,
+            'destination_account_id' => $receiver->id,
+            'amount' => '25.00',
+            'currency' => 'USD',
+        ];
+
+        $lock = Cache::store(config('cache.default'))->lock(idempotencyLockKey((string) $merchant->id, 'feature-transfer-6'), 10);
+        expect($lock->get())->toBeTrue();
+
+        try {
+            $this->withHeaders(
+                signedTransferHeaders($plainTextKey, $payload, 'feature-transfer-6')
+            )->postJson('/api/v1/transfers', $payload)->assertStatus(409)
+                ->assertJsonPath('error', 'IDEMPOTENCY_REQUEST_IN_PROGRESS');
+        } finally {
+            $lock->release();
+        }
     });
 });

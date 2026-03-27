@@ -4,19 +4,27 @@ namespace App\Services;
 
 use App\Exceptions\AccountInactiveException;
 use App\Exceptions\AccountNotFoundException;
+use App\Exceptions\IdempotencyRequestInProgressException;
 use App\Exceptions\InsufficientFundsException;
 use App\Models\Account;
 use App\Models\IdempotencyKey;
 use App\Models\LedgerEntry;
 use App\Models\Transfer;
+use Illuminate\Contracts\Cache\LockTimeoutException;
+use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use InvalidArgumentException;
 
 class TransferService
 {
     private const IDEMPOTENCY_TTL_SECONDS = 86400;
+
+    private const IDEMPOTENCY_LOCK_SECONDS = 10;
+
+    private const IDEMPOTENCY_LOCK_WAIT_SECONDS = 2;
 
     /**
      * @return array{response: array{transfer: array<string, mixed>, status: string}, responseCode: int, transfer: Transfer}
@@ -43,137 +51,174 @@ class TransferService
             Cache::forget($cacheKey);
         }
 
-        $dispatchWebhook = false;
-
         try {
-            $result = DB::transaction(function () use (
-                $merchantId,
-                $senderAccountId,
-                $receiverAccountId,
-                $amount,
-                $currency,
-                $idempotencyKey,
-                $signature,
-                $requestPath,
-            ): array {
-                $storedResponse = $this->resolveStoredResponse($merchantId, $idempotencyKey);
-                if ($storedResponse !== null) {
-                    return $storedResponse;
-                }
+            return $this->lockStore()->lock($this->lockKey($merchantId, $idempotencyKey), self::IDEMPOTENCY_LOCK_SECONDS)
+                ->block(self::IDEMPOTENCY_LOCK_WAIT_SECONDS, function () use (
+                    $merchantId,
+                    $senderAccountId,
+                    $receiverAccountId,
+                    $amount,
+                    $currency,
+                    $idempotencyKey,
+                    $signature,
+                    $requestPath,
+                    $cacheKey,
+                ): array {
+                    $storedResponse = $this->resolveStoredResponse($merchantId, $idempotencyKey);
+                    if ($storedResponse !== null) {
+                        Cache::put($cacheKey, $storedResponse['transfer']->id, now()->addSeconds(self::IDEMPOTENCY_TTL_SECONDS));
 
-                if ($senderAccountId === $receiverAccountId) {
-                    throw new InvalidArgumentException('Source and destination accounts must be different.');
-                }
+                        return $storedResponse;
+                    }
 
-                $lockIds = [$senderAccountId, $receiverAccountId];
-                sort($lockIds);
+                    try {
+                        $transferId = DB::transaction(function () use (
+                            $merchantId,
+                            $senderAccountId,
+                            $receiverAccountId,
+                            $amount,
+                            $currency,
+                            $idempotencyKey,
+                            $signature,
+                        ): string {
+                            if ($senderAccountId === $receiverAccountId) {
+                                throw new InvalidArgumentException('Source and destination accounts must be different.');
+                            }
 
-                $accounts = Account::query()
-                    ->where('merchant_id', $merchantId)
-                    ->whereIn('id', $lockIds)
-                    ->lockForUpdate()
-                    ->get()
-                    ->keyBy('id');
+                            $lockIds = [$senderAccountId, $receiverAccountId];
+                            sort($lockIds);
 
-                /** @var Account|null $sender */
-                $sender = $accounts->get($senderAccountId);
-                /** @var Account|null $receiver */
-                $receiver = $accounts->get($receiverAccountId);
+                            $accounts = Account::query()
+                                ->where('merchant_id', $merchantId)
+                                ->whereIn('id', $lockIds)
+                                ->lockForUpdate()
+                                ->get()
+                                ->keyBy('id');
 
-                if (! $sender || ! $receiver) {
-                    throw new AccountNotFoundException('One or more accounts not found.');
-                }
+                            /** @var Account|null $sender */
+                            $sender = $accounts->get($senderAccountId);
+                            /** @var Account|null $receiver */
+                            $receiver = $accounts->get($receiverAccountId);
 
-                if (! $sender->is_active || ! $receiver->is_active) {
-                    throw new AccountInactiveException('One or more accounts are inactive.');
-                }
+                            if (! $sender || ! $receiver) {
+                                throw new AccountNotFoundException('One or more accounts not found.');
+                            }
 
-                if ($sender->currency !== $currency || $receiver->currency !== $currency) {
-                    throw new InvalidArgumentException("Currency mismatch. Account currency must be {$currency}.");
-                }
+                            if (! $sender->is_active || ! $receiver->is_active) {
+                                throw new AccountInactiveException('One or more accounts are inactive.');
+                            }
 
-                $amountDecimal = bcadd($amount, '0', 2);
+                            if ($sender->currency !== $currency || $receiver->currency !== $currency) {
+                                throw new InvalidArgumentException("Currency mismatch. Account currency must be {$currency}.");
+                            }
 
-                if (bccomp((string) $sender->balance, $amountDecimal, 2) < 0) {
-                    throw new InsufficientFundsException(
-                        "Insufficient funds. Available: {$sender->balance}, Requested: {$amountDecimal}",
-                    );
-                }
+                            $amountDecimal = bcadd($amount, '0', 2);
 
-                $transfer = Transfer::create([
-                    'merchant_id' => $merchantId,
-                    'idempotency_key' => $idempotencyKey,
-                    'source_account_id' => $senderAccountId,
-                    'destination_account_id' => $receiverAccountId,
-                    'amount' => $amountDecimal,
-                    'currency' => $currency,
-                    'status' => Transfer::STATUS_PROCESSING,
-                    'signature' => $signature,
-                ]);
+                            if (bccomp((string) $sender->balance, $amountDecimal, 2) < 0) {
+                                throw new InsufficientFundsException(
+                                    "Insufficient funds. Available: {$sender->balance}, Requested: {$amountDecimal}",
+                                );
+                            }
 
-                $newSenderBalance = bcsub((string) $sender->balance, $amountDecimal, 2);
-                $newReceiverBalance = bcadd((string) $receiver->balance, $amountDecimal, 2);
+                            $transfer = Transfer::create([
+                                'merchant_id' => $merchantId,
+                                'idempotency_key' => $idempotencyKey,
+                                'source_account_id' => $senderAccountId,
+                                'destination_account_id' => $receiverAccountId,
+                                'amount' => $amountDecimal,
+                                'currency' => $currency,
+                                'status' => Transfer::STATUS_PROCESSING,
+                                'signature' => $signature,
+                            ]);
 
-                $sender->forceFill(['balance' => $newSenderBalance])->save();
-                $receiver->forceFill(['balance' => $newReceiverBalance])->save();
+                            $newSenderBalance = bcsub((string) $sender->balance, $amountDecimal, 2);
+                            $newReceiverBalance = bcadd((string) $receiver->balance, $amountDecimal, 2);
 
-                LedgerEntry::create([
-                    'transfer_id' => $transfer->id,
-                    'account_id' => $sender->id,
-                    'type' => LedgerEntry::TYPE_DEBIT,
-                    'amount' => $amountDecimal,
-                    'balance_after' => $newSenderBalance,
-                    'currency' => $currency,
-                ]);
+                            $sender->forceFill(['balance' => $newSenderBalance])->save();
+                            $receiver->forceFill(['balance' => $newReceiverBalance])->save();
 
-                LedgerEntry::create([
-                    'transfer_id' => $transfer->id,
-                    'account_id' => $receiver->id,
-                    'type' => LedgerEntry::TYPE_CREDIT,
-                    'amount' => $amountDecimal,
-                    'balance_after' => $newReceiverBalance,
-                    'currency' => $currency,
-                ]);
+                            $timestamp = now();
 
-                $transfer->forceFill(['status' => Transfer::STATUS_COMPLETED])->save();
+                            LedgerEntry::query()->insert([
+                                [
+                                    'id' => (string) Str::uuid(),
+                                    'transfer_id' => $transfer->id,
+                                    'account_id' => $sender->id,
+                                    'type' => LedgerEntry::TYPE_DEBIT,
+                                    'amount' => $amountDecimal,
+                                    'balance_after' => $newSenderBalance,
+                                    'currency' => $currency,
+                                    'created_at' => $timestamp,
+                                    'updated_at' => $timestamp,
+                                ],
+                                [
+                                    'id' => (string) Str::uuid(),
+                                    'transfer_id' => $transfer->id,
+                                    'account_id' => $receiver->id,
+                                    'type' => LedgerEntry::TYPE_CREDIT,
+                                    'amount' => $amountDecimal,
+                                    'balance_after' => $newReceiverBalance,
+                                    'currency' => $currency,
+                                    'created_at' => $timestamp,
+                                    'updated_at' => $timestamp,
+                                ],
+                            ]);
 
-                $freshTransfer = $transfer->fresh([
-                    'merchant',
-                    'sourceAccount',
-                    'destinationAccount',
-                ]);
+                            $transfer->forceFill(['status' => Transfer::STATUS_COMPLETED])->save();
 
-                $response = $this->responsePayload($freshTransfer);
+                            return (string) $transfer->id;
+                        }, 5);
+                    } catch (UniqueConstraintViolationException) {
+                        $existingTransfer = $this->findTransfer($merchantId, $idempotencyKey);
+                        if ($existingTransfer === null) {
+                            throw new IdempotencyRequestInProgressException('A request with the same Idempotency-Key is currently being processed.');
+                        }
 
-                IdempotencyKey::create([
-                    'merchant_id' => $merchantId,
-                    'idempotency_key' => $idempotencyKey,
-                    'request_path' => $requestPath,
-                    'response_code' => $response['responseCode'],
-                    'response_body' => $response['response'],
-                    'expires_at' => now()->addHours(24),
-                ]);
+                        $response = $this->persistAndBuildResponse($merchantId, $idempotencyKey, $requestPath, $existingTransfer);
+                        Cache::put($cacheKey, $existingTransfer->id, now()->addSeconds(self::IDEMPOTENCY_TTL_SECONDS));
 
-                return $response;
-            }, 5);
+                        return $response;
+                    }
 
-            $dispatchWebhook = true;
-        } catch (UniqueConstraintViolationException) {
-            $result = $this->resolveStoredResponse($merchantId, $idempotencyKey, true);
+                    $transfer = $this->findTransfer($merchantId, $idempotencyKey, $transferId);
+                    if ($transfer === null) {
+                        throw new IdempotencyRequestInProgressException('Transfer commit completed but the response is not yet available.');
+                    }
+
+                    $response = $this->persistAndBuildResponse($merchantId, $idempotencyKey, $requestPath, $transfer);
+                    Cache::put($cacheKey, $transfer->id, now()->addSeconds(self::IDEMPOTENCY_TTL_SECONDS));
+
+                    WebhookService::dispatch($merchantId, 'transfer.succeeded', $transfer->toArray());
+
+                    return $response;
+                });
+        } catch (LockTimeoutException) {
+            $storedResponse = $this->resolveStoredResponse($merchantId, $idempotencyKey);
+            if ($storedResponse !== null) {
+                Cache::put($cacheKey, $storedResponse['transfer']->id, now()->addSeconds(self::IDEMPOTENCY_TTL_SECONDS));
+
+                return $storedResponse;
+            }
+
+            throw new IdempotencyRequestInProgressException('A request with the same Idempotency-Key is currently being processed.');
         }
-
-        Cache::put($cacheKey, $result['transfer']->id, now()->addSeconds(self::IDEMPOTENCY_TTL_SECONDS));
-
-        if ($dispatchWebhook) {
-            WebhookService::dispatch($merchantId, 'transfer.succeeded', $result['transfer']->toArray());
-        }
-
-        return $result;
     }
 
     private function cacheKey(string $merchantId, string $idempotencyKey): string
     {
         return "transfer:{$merchantId}:{$idempotencyKey}";
+    }
+
+    private function lockKey(string $merchantId, string $idempotencyKey): string
+    {
+        return "transfer-lock:{$merchantId}:{$idempotencyKey}";
+    }
+
+    private function lockStore(): Repository
+    {
+        $defaultStore = (string) config('cache.default', 'array');
+
+        return Cache::store($defaultStore === 'redis' ? 'redis' : $defaultStore);
     }
 
     private function findTransfer(string $merchantId, string $idempotencyKey, ?string $transferId = null): ?Transfer
@@ -229,6 +274,33 @@ class TransferService
             'responseCode' => $stored->response_code,
             'transfer' => $transfer,
         ];
+    }
+
+    /**
+     * @return array{response: array{transfer: array<string, mixed>, status: string}, responseCode: int, transfer: Transfer}
+     */
+    private function persistAndBuildResponse(
+        string $merchantId,
+        string $idempotencyKey,
+        string $requestPath,
+        Transfer $transfer,
+    ): array {
+        $response = $this->responsePayload($transfer);
+
+        IdempotencyKey::query()->updateOrCreate(
+            [
+                'merchant_id' => $merchantId,
+                'idempotency_key' => $idempotencyKey,
+            ],
+            [
+                'request_path' => $requestPath,
+                'response_code' => $response['responseCode'],
+                'response_body' => $response['response'],
+                'expires_at' => now()->addHours(24),
+            ],
+        );
+
+        return $response;
     }
 
     /**

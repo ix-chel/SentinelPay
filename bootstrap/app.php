@@ -2,7 +2,9 @@
 
 use App\Exceptions\AccountInactiveException;
 use App\Exceptions\AccountNotFoundException;
+use App\Exceptions\IdempotencyRequestInProgressException;
 use App\Exceptions\InsufficientFundsException;
+use App\Http\Middleware\VerifyHmacSignature;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
@@ -17,7 +19,7 @@ return Application::configure(basePath: dirname(__DIR__))
     )
     ->withMiddleware(function (Middleware $middleware): void {
         $middleware->alias([
-            'hmac' => \App\Http\Middleware\VerifyHmacSignature::class,
+            'hmac' => VerifyHmacSignature::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
@@ -43,7 +45,14 @@ return Application::configure(basePath: dirname(__DIR__))
             ], 404);
         });
 
-        $exceptions->render(function (\InvalidArgumentException $e): JsonResponse {
+        $exceptions->render(function (IdempotencyRequestInProgressException $e): JsonResponse {
+            return response()->json([
+                'error' => 'IDEMPOTENCY_REQUEST_IN_PROGRESS',
+                'message' => $e->getMessage(),
+            ], 409);
+        });
+
+        $exceptions->render(function (InvalidArgumentException $e): JsonResponse {
             return response()->json([
                 'error' => 'INVALID_TRANSFER',
                 'message' => $e->getMessage(),
