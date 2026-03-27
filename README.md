@@ -18,8 +18,6 @@ This is not a finished payment platform, not a PSP, and not something that shoul
 
 ## Honest Project Status
 
-If a senior engineer reads this repository, the safest description is:
-
 > "SentinelPay is a backend-focused transfer system prototype. The transfer path is reasonably thought through, but the surrounding platform concerns are still incomplete."
 
 What is still missing or immature:
@@ -125,15 +123,3 @@ Even with the gaps above, there is real engineering value here:
 - The codebase is small enough to evolve without a full rewrite.
 
 The right expectation is not "production payment system." The right expectation is "promising foundation for a payment-system-style backend exercise."
-
-## Recommended Next Steps Before a Serious Senior Review
-
-- Align the documentation with the real route surface and active auth flow.
-- Remove or finish stale code paths such as unused request/auth abstractions.
-- Add database-level protections if the ledger is meant to be truly immutable.
-- Enforce API key scopes per route instead of only storing them.
-- Add monitoring, queue failure visibility, and webhook delivery diagnostics.
-- Expand test coverage around rate limiting, webhook failures, and recovery scenarios.
-- Define the real product boundary: internal ledger transfer service, or broader payment platform.
-
-If this README is used during review, keep the conversation anchored on what is already solid in the transfer core and be explicit that the rest is ongoing platform hardening work.
