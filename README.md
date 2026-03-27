@@ -1,79 +1,139 @@
 # SentinelPay
 
-SentinelPay is a payment API built with **Laravel 12**, **PostgreSQL**, **Redis**, and **RabbitMQ**. It uses row-level locking and append-only ledger entries to keep balance mutations and transfer history consistent.
+SentinelPay is a Laravel 12 backend prototype for merchant-owned account transfers. The strongest part of this project is transaction correctness under concurrency: row-level locking, idempotency handling, paired ledger entries, and queued webhook delivery.
 
-## Key Architecture & Features
+This is not a finished payment platform, not a PSP, and not something that should be presented as production-ready without caveats. It is better described as a solid technical prototype with a few well-implemented core ideas and several areas that still need hardening.
 
-### 1. PostgreSQL Transfer Integrity
-Transfers are executed inside a PostgreSQL transaction and use row-level locks on both accounts.
-- Concurrent debits are serialized with `SELECT ... FOR UPDATE`.
-- Each successful transfer writes paired debit and credit ledger entries.
-- The `audit:ledger` command verifies that account balances match the latest recorded ledger balance.
+## What This Project Actually Does Well
 
-### 2. Idempotency & Fault Tolerance
-The `POST /api/v1/transfers` endpoint enforces idempotency using the `Idempotency-Key` header.
-- Safely retry failed network requests without the risk of double-charging.
-- Idempotent responses are persisted and cached so retries return the same transfer without replaying balance mutations.
+- Executes transfers inside a PostgreSQL transaction.
+- Locks both accounts with deterministic ordering plus `SELECT ... FOR UPDATE` to reduce double-spend and deadlock risk.
+- Persists paired debit and credit ledger entries for each successful transfer.
+- Replays duplicate requests via merchant-scoped idempotency keys instead of charging twice.
+- Supports merchant API keys with hashed storage and simple per-key rate limiting.
+- Requires HMAC request signatures for transfer creation.
+- Dispatches webhook deliveries asynchronously through RabbitMQ-backed queues.
+- Includes an `audit:ledger` command to compare stored account balances against the latest ledger balance.
+- Ships with a small Blade dashboard for local inspection and demo purposes.
 
-### 3. API Key Management & Security
-- **Hashed Storage**: API keys are generated as cryptographically secure strings and safely stored via SHA-256 hashes.
-- **Scoping & Rate Limiting**: Keys can be restricted to specific endpoints and are rate-limited per minute.
-- **Signed Transfer Requests**: `POST /api/v1/transfers` requires an `X-Signature` HMAC-SHA256 header over the raw JSON body.
-- **Signed Webhook Deliveries**: Webhook deliveries use a `Stripe-Signature` style HMAC so merchants can verify payload authenticity.
+## Honest Project Status
 
-### 4. Webhook Eventing
-- Async delivery of events (e.g., `transfer.succeeded`) to registered merchant endpoints.
-- Managed by Laravel Queues featuring exponential backoff for failed deliveries.
+If a senior engineer reads this repository, the safest description is:
 
-### 5. Automated API Documentation
-- Zero-config OpenAPI specifications are automatically generated.
-- Accessible via Swagger UI at `http://localhost:8080/docs/api`.
+> "SentinelPay is a backend-focused transfer system prototype. The transfer path is reasonably thought through, but the surrounding platform concerns are still incomplete."
 
-## Getting Started
+What is still missing or immature:
+
+- This is not a complete payment lifecycle. There are no refunds, reversals, chargebacks, disputes, settlement flows, or external banking rails.
+- The ledger is append-only by application behavior, but database-level immutability protections are not implemented yet.
+- API key scopes exist in the data model and middleware, but route-level scope enforcement is not actually used today.
+- The authentication story is inconsistent. API key authentication is active, while Sanctum-related code and older docs still exist but are not part of the active route flow.
+- Operational maturity is limited: no structured observability stack, no dead-letter strategy, no alerting, no tracing, and no serious incident tooling.
+- Webhook delivery is basic retry logic, not a full delivery platform.
+- The dashboard is a demo/debugging UI, not a hardened admin console.
+- Some files under `docs/` describe behavior that no longer matches the current implementation and should be treated as draft documentation.
+- There is no claim here around PCI, fraud detection, KYC, secret rotation, backup policy, or compliance readiness.
+
+## Architecture Summary
+
+Current stack:
+
+- Laravel 12
+- PostgreSQL 17
+- Redis 7
+- RabbitMQ 3
+- Nginx
+- Docker Compose
+
+Core flow:
+
+1. Merchant sends a signed transfer request with `X-API-Key`, `Idempotency-Key`, and `X-Signature`.
+2. The API validates the key, rate limit, and HMAC signature.
+3. The transfer service acquires an idempotency lock, opens a database transaction, and locks both accounts.
+4. Balances are updated, the transfer is stored, and paired ledger rows are inserted.
+5. The response is persisted for idempotent replay.
+6. A webhook job is queued after commit.
+
+## API Surface Available Today
+
+Current routes implemented in `routes/api.php`:
+
+- `GET /api/v1/health`
+- `POST /api/v1/merchants`
+- `POST /api/v1/keys`
+- `DELETE /api/v1/keys/{id}`
+- `POST /api/v1/transfers`
+- `GET /api/v1/transfers/{id}`
+- `GET /api/v1/balances`
+- `GET /api/v1/ledger/{accountId}`
+- `GET /api/v1/webhooks`
+- `POST /api/v1/webhooks`
+- `DELETE /api/v1/webhooks/{id}`
+
+Anything beyond that should be treated as planned work, not current capability.
+
+## Local Development
 
 ### Prerequisites
-- [Docker](https://www.docker.com/) & [Docker Compose](https://docs.docker.com/compose/)
-- [Composer](https://getcomposer.org/) (for installing dependencies initially)
 
-### Installation & Setup
+- Docker Desktop
+- Docker Compose
 
-1. **Clone & Install Dependencies**
-   ```bash
-   git clone https://github.com/your-username/SentinelPay.git
-   cd SentinelPay
-   composer install
-   cp .env.example .env
-   php artisan key:generate
-   ```
+### Bootstrapping
 
-2. **Start the Infrastructure**
-   ```bash
-   docker compose up -d --build
-   ```
-   *This starts Nginx, PHP-FPM, PostgreSQL, Redis, and RabbitMQ.*
-
-3. **Migrate & Seed Data**
-   ```bash
-   docker compose exec app php artisan migrate:fresh --seed --force
-   ```
-
-4. **Access the Dashboard**
-   Navigate to `http://localhost:8080/dashboard` in your browser to view the seeded merchant, API key, transfers, and webhook logs.
-
-5. **Test the API**
-   Use the seeded API key `sp_live_demo1234567890` and sign transfer payloads with `HMAC_SECRET` against `http://localhost:8080/api/v1/...`.
-
-## Running Tests & Audits
-Run the Pest/PHPUnit test suite:
 ```bash
-docker compose exec app php artisan test
+cp .env.example .env
+docker compose up -d --build
+docker compose exec app php artisan key:generate --no-interaction
+docker compose exec app php artisan migrate:fresh --seed --force
 ```
 
-Run the Ledger Audit tool to perform a financial integrity check:
+Local endpoints:
+
+- App: `http://localhost:8080`
+- Dashboard: `http://localhost:8080/dashboard`
+- RabbitMQ UI: `http://localhost:15672`
+
+The default seeder creates:
+
+- Merchant: `Acme Corp`
+- Demo API key: `sp_live_demo1234567890`
+
+That seeded key is for local development only. It must never be treated as a real credential pattern for production.
+
+## Running Tests
+
+Run the focused test container:
+
 ```bash
-docker compose exec app php artisan audit:ledger
+docker compose run --rm --profile test test --compact
 ```
 
-## Useful Links
-- **API Reference**: `http://localhost:8080/docs/api`
-- **Postman Collection**: Locate the JSON export in the `docs/` folder.
+Useful targeted runs:
+
+```bash
+docker compose run --rm --profile test test tests/Feature/TransferTest.php --compact
+docker compose run --rm --profile test test tests/Feature/AuditLedgerCommandTest.php --compact
+```
+
+## Why This Repo Is Still Worth Reviewing
+
+Even with the gaps above, there is real engineering value here:
+
+- The transfer path prioritizes correctness over superficial CRUD completeness.
+- The project shows awareness of idempotency, balance drift, and concurrent mutation risk.
+- The codebase is small enough to evolve without a full rewrite.
+
+The right expectation is not "production payment system." The right expectation is "promising foundation for a payment-system-style backend exercise."
+
+## Recommended Next Steps Before a Serious Senior Review
+
+- Align the documentation with the real route surface and active auth flow.
+- Remove or finish stale code paths such as unused request/auth abstractions.
+- Add database-level protections if the ledger is meant to be truly immutable.
+- Enforce API key scopes per route instead of only storing them.
+- Add monitoring, queue failure visibility, and webhook delivery diagnostics.
+- Expand test coverage around rate limiting, webhook failures, and recovery scenarios.
+- Define the real product boundary: internal ledger transfer service, or broader payment platform.
+
+If this README is used during review, keep the conversation anchored on what is already solid in the transfer core and be explicit that the rest is ongoing platform hardening work.
