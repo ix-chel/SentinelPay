@@ -1,68 +1,103 @@
-# SentinelPay Deployment Guide
+# SentinelPay Deployment & Operations Guide
 
-This guide covers how to deploy the SentinelPay backend API using Docker compose for production or staging environments.
+This guide covers setup, environment configuration, database migration, and operation of SentinelPay.
 
 ## Prerequisites
-- Docker Engine & Docker Compose
-- Minimum 2GB RAM
-- `openssl` (for testing/generating HMAC secrets)
+- **PHP**: 8.2+ with extensions: `pdo_pgsql`, `bcmath`, `openssl`, `mbstring`
+- **Package Managers**: Composer 2.x, Node.js 18+ & npm
+- **Database**: PostgreSQL 15+ (local native or cloud provider e.g. Supabase)
 
-## Environment Configuration
+---
 
-Copy the example environment file and configure it:
-```bash
-cp .env.example .env
-```
+## 1. Local Native Development Setup
 
-### Critical Variables
-Ensure the following variables are properly set in your `.env` file before starting the containers:
-
-| Variable | Description | Default |
-| -------- | ----------- | ------- |
-| `APP_ENV` | Environment type (`production`, `local`) | `production` |
-| `DB_CONNECTION` | Database driver (Must be `pgsql`) | `pgsql` |
-| `REDIS_HOST` | Redis Server hostname | `redis` |
-| `RABBITMQ_HOST` | RabbitMQ Server hostname | `rabbitmq` |
-| `QUEUE_CONNECTION` | Default queue driver | `rabbitmq` |
-| `HMAC_SECRET` | 32+ character crypto-secure string | *(Generate a new one)* |
-
-Generate a secure HMAC key using `openssl`:
-```bash
-openssl rand -hex 32
-```
-
-## Running the Application
-
-1. **Start the containers in detached mode:**
-   ```bash
-   docker compose up -d --build
+1. **Clone repository and install dependencies:**
+   ```powershell
+   composer install
+   npm install
    ```
 
-2. **Generate the application key:**
-   ```bash
-   docker compose exec app php artisan key:generate
+2. **Environment configuration:**
+   ```powershell
+   Copy-Item .env.example .env
+   php artisan key:generate
    ```
 
-3. **Run database migrations:**
-   ```bash
-   docker compose exec app php artisan migrate --force
+3. **Configure Database Connection in `.env`:**
+   ```ini
+   DB_CONNECTION=pgsql
+   DB_HOST=aws-0-xx.pooler.supabase.com
+   DB_PORT=5432
+   DB_DATABASE=postgres
+   DB_USERNAME=postgres.your-project-id
+   DB_PASSWORD=your-secure-password
+   DB_SSLMODE=require
+
+   # Cryptographic Secret for Payment Signatures
+   HMAC_SECRET=your-32-character-crypto-secret
+
+   # Local Cache and Queue Drivers
+   CACHE_STORE=file
+   SESSION_DRIVER=file
+   QUEUE_CONNECTION=sync
    ```
 
-## Infrastructure Components
+4. **Run Database Migrations & Seeders:**
+   ```powershell
+   php artisan migrate
+   php artisan db:seed
+   ```
 
-- **App (PHP-FPM + Nginx)**: Handles incoming HTTP traffic. Runs on port `8080`.
-- **PostgreSQL**: The relational database. Runs on port `5432`.
-- **Redis**: Handles Idempotency checks and Cache. Runs on port `6379`.
-- **RabbitMQ**: Message queue. Runs on port `5672` (Broker) and `15672` (Management UI).
+5. **Compile Frontend & Start Servers:**
+   - Terminal 1 (Vite Dev Server):
+     ```powershell
+     npm run dev
+     ```
+   - Terminal 2 (Laravel API Server):
+     ```powershell
+     php artisan serve
+     ```
 
-## Monitoring & System Integrity
+6. **Access:**
+   - Dashboard UI: `http://localhost:8000`
+   - Health Probe: `http://localhost:8000/api/v1/health`
 
-### Ledger Audit
-To ensure no database manipulation has occurred, run the periodic ledger audit command:
+---
+
+## 2. Production Deployment & Containerization
+
+### Critical Environment Variables
+| Variable | Production Value | Note |
+|---|---|---|
+| `APP_ENV` | `production` | Disables debug traces |
+| `APP_DEBUG` | `false` | Prevents sensitive data leakage |
+| `DB_CONNECTION` | `pgsql` | Required for PostgreSQL ACID locking & triggers |
+| `CACHE_STORE` | `redis` | Multi-node distributed idempotency cache |
+| `QUEUE_CONNECTION` | `rabbitmq` | Asynchronous worker message broker |
+| `HMAC_SECRET` | *(64-hex random string)* | Request signing master secret |
+
+### Build Production Frontend Assets
 ```bash
-docker compose exec app php artisan audit:ledger
+npm run build
 ```
-This tool recalculates every account balance based strictly on the immutable `ledgers` table log, verifying that it precisely matches the instantaneous balance stored on the `accounts` table.
+Compiled assets and manifest are placed into `public/build/`.
 
-### RabbitMQ Management
-You can monitor queue health and unprocessed webhook jobs via the RabbitMQ UI at `http://localhost:15672` (Default credentials: guest / guest).
+### Run Production Migrations
+```bash
+php artisan migrate --force
+```
+
+---
+
+## 3. Operational Integrity & Audit Tooling
+
+### Ledger Reconciliation Audit
+Run the built-in ledger audit tool to mathematically verify that all account balances match the cumulative sum of immutable ledger entries:
+```bash
+php artisan audit:ledger
+```
+
+To automatically reconcile any drifted balances to match the ledger source of truth:
+```bash
+php artisan audit:ledger --fix
+```

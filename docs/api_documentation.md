@@ -1,82 +1,228 @@
-# SentinelPay API Documentation
+# SentinelPay API Documentation (v1)
 
-This document describes the REST API endpoints available in SentinelPay. 
+This document provides the complete, authoritative specification for all REST API endpoints in SentinelPay.
 
 ## Base URL
-All API requests should be prefixed with `/api/v1`.
+All API requests must be prefixed with `/api/v1`.
 
-## Authentication & Security
-All mutating endpoints must include an HMAC-SHA256 signature to prevent man-in-the-middle tampering.
-- **Header**: `X-Signature: <hex_encoded_hmac>`
-- **Secret**: The shared `HMAC_SECRET` symmetric key.
-- **Algorithm**: `hash_hmac('sha256', $rawRequestBody, $secret)`
+## Security & Authentication Architecture
 
-Read-only endpoints (e.g., balance checking) utilize a Sanctum token via the Authorization header (`Bearer <token>`).
+SentinelPay employs a dual-tier authentication strategy:
+1. **Mutating Payment Execution (`POST /transfers`)**:
+   - Requires an `X-Signature` header calculated using HMAC-SHA256 over the raw JSON payload with `HMAC_SECRET`.
+   - Timing-safe verification is enforced via `hash_equals()`.
+   - If called by an authenticated user with a Sanctum Bearer token, sender account ownership is verified.
+2. **Account Introspection & Session (`/accounts/*`, `/auth/*`)**:
+   - Protected via Laravel Sanctum (`Authorization: Bearer <sanctum_token>`).
+   - Only the authenticated account owner may inspect balances or transactions. Horizontal privilege escalation returns `403 Forbidden`.
+3. **Public / Monitoring**:
+   - `GET /health` is public for uptime monitoring and probes.
 
 ---
 
-## Endpoints
+## Rate Limiting Policy
 
-### 1. Execute a Transfer
-Creates a new transfer between two active accounts in the same currency.
+| Endpoint | Method | Rate Limit | Protection Objective |
+|---|---|---|---|
+| `/auth/login` | `POST` | 5 req / min | Brute-force & credential stuffing prevention |
+| `/auth/logout` | `POST` | 60 req / min | Session cleanup throttling |
+| `/transfers` | `POST` | 30 req / min | Financial flooding & wallet draining defense |
+| `/accounts` | `GET` | 60 req / min | Account enumeration throttling |
+| `/accounts/{id}/balance` | `GET` | 60 req / min | Polling defense |
+| `/accounts/{id}/transactions` | `GET` | 60 req / min | Query flood defense |
+| `/health` | `GET` | 120 req / min | Uptime monitoring |
 
-**Endpoint:** `POST /transfers`
+---
 
-**Headers:**
-- `Content-Type: application/json`
-- `X-Signature: <hmac_sha256>`
+## API Endpoints
 
-**Request Body:**
+### 1. Health Probe
+- **Endpoint**: `GET /api/v1/health`
+- **Headers**: None
+- **Response `200 OK`**:
 ```json
 {
-  "sender_account_id": "9a3b-...",
-  "receiver_account_id": "1f8c-...",
-  "amount": "150.00",
-  "currency": "USD",
-  "idempotency_key": "unique-request-id-12345"
+  "status": "ok",
+  "service": "SentinelPay",
+  "timestamp": "2026-09-22T17:31:35+00:00"
 }
 ```
 
-**Responses:**
-- `201 Created`: Transfer successful.
-- `401 Unauthorized`: Missing `X-Signature`.
-- `403 Forbidden`: Invalid signature.
-- `422 Unprocessable Entity`: Insufficient funds or validation rules failed.
+---
+
+### 2. User Login
+Authenticate and obtain a Sanctum Bearer token.
+- **Endpoint**: `POST /api/v1/auth/login`
+- **Headers**: `Content-Type: application/json`
+- **Request Body**:
+```json
+{
+  "email": "operator@sentinelpay.io",
+  "password": "SecretPassword123"
+}
+```
+- **Response `200 OK`**:
+```json
+{
+  "status": "success",
+  "message": "Authenticated successfully.",
+  "data": {
+    "token": "1|8f921...plainTextToken",
+    "token_type": "Bearer",
+    "user": {
+      "id": "01a0c9f0-9252-71b9-a27c-d47a4eabbe34",
+      "name": "Operator",
+      "email": "operator@sentinelpay.io",
+      "accounts": [
+        {
+          "id": "01a0c9f0-9252-71b9-a27c-d47a4eabbe34",
+          "balance": "10000.00",
+          "currency": "USD",
+          "is_active": true
+        }
+      ]
+    }
+  }
+}
+```
+- **Error Responses**:
+  - `401 Unauthorized`: `"The provided credentials are incorrect."`
+  - `422 Unprocessable Entity`: Validation failed on email or password.
 
 ---
 
-### 2. Check Account Balance
-Retrieve the current available balance for an account.
+### 3. User Logout
+Revokes the current Sanctum token.
+- **Endpoint**: `POST /api/v1/auth/logout`
+- **Headers**: `Authorization: Bearer <sanctum_token>`
+- **Response `200 OK`**:
+```json
+{
+  "status": "success",
+  "message": "Token revoked. You have been logged out."
+}
+```
 
-**Endpoint:** `GET /accounts/{account_id}/balance`
+---
 
-**Headers:**
-- `Authorization: Bearer <sanctum_token>`
+### 4. List User Accounts
+Returns all accounts owned by the authenticated user.
+- **Endpoint**: `GET /api/v1/accounts`
+- **Headers**: `Authorization: Bearer <sanctum_token>`
+- **Response `200 OK`**:
+```json
+{
+  "status": "success",
+  "data": [
+    {
+      "id": "01a0c9f0-9252-71b9-a27c-d47a4eabbe34",
+      "balance": "10000.00",
+      "currency": "USD",
+      "is_active": true,
+      "created_at": "2026-09-22T00:00:00.000000Z"
+    }
+  ]
+}
+```
 
-**Responses:**
-- `200 OK`: 
+---
+
+### 5. Check Account Balance
+Retrieve current available balance for an account. Requires ownership.
+- **Endpoint**: `GET /api/v1/accounts/{account_id}/balance`
+- **Headers**: `Authorization: Bearer <sanctum_token>`
+- **Response `200 OK`**:
 ```json
 {
   "status": "success",
   "data": {
-    "account_id": "9a3b-...",
-    "balance": "1500.00",
+    "account_id": "01a0c9f0-9252-71b9-a27c-d47a4eabbe34",
+    "balance": "10000.00",
     "currency": "USD",
     "is_active": true
   }
 }
 ```
-- `403 Forbidden`: The account does not belong to the authenticated user.
+- **Error Responses**:
+  - `403 Forbidden`: Account does not belong to authenticated user (`"FORBIDDEN"`).
+  - `404 Not Found`: Account does not exist.
 
 ---
 
-### 3. Get Account Transactions
-Retrieve a paginated list of sent and received transactions for an account.
+### 6. Get Account Transactions
+Retrieve paginated transaction history for an account. Requires ownership.
+- **Endpoint**: `GET /api/v1/accounts/{account_id}/transactions?per_page=20`
+- **Headers**: `Authorization: Bearer <sanctum_token>`
+- **Response `200 OK`**:
+```json
+{
+  "status": "success",
+  "data": {
+    "current_page": 1,
+    "data": [
+      {
+        "id": "3a1e204c-...",
+        "idempotency_key": "4f8a12e9-...",
+        "sender_id": "01a0c9f0-...",
+        "receiver_id": "02b1d8e1-...",
+        "amount": "150.00",
+        "currency": "USD",
+        "status": "completed",
+        "created_at": "2026-09-22T17:35:00.000000Z"
+      }
+    ],
+    "per_page": 20,
+    "total": 1
+  }
+}
+```
 
-**Endpoint:** `GET /accounts/{account_id}/transactions?per_page=20`
+---
 
-**Headers:**
-- `Authorization: Bearer <sanctum_token>`
-
-**Responses:**
-- `200 OK`: returns a paginated Laravel JSON response of `Transaction` models.
+### 7. Execute Fund Transfer
+Initiate an ACID fund transfer with row-level locking and idempotency guarantees.
+- **Endpoint**: `POST /api/v1/transfers`
+- **Headers**:
+  - `Content-Type: application/json`
+  - `X-Signature: <hmac_sha256_hex>`
+  - `Authorization: Bearer <sanctum_token>` *(optional for M2M; mandatory if enforcing user account boundary)*
+- **Request Body**:
+```json
+{
+  "sender_account_id": "01a0c9f0-9252-71b9-a27c-d47a4eabbe34",
+  "receiver_account_id": "02b1d8e1-4567-89ab-cdef-0123456789ab",
+  "amount": "150.00",
+  "currency": "USD",
+  "idempotency_key": "unique-request-uuid-here"
+}
+```
+- **Response `201 Created`**:
+```json
+{
+  "status": "success",
+  "message": "Transfer completed successfully.",
+  "data": {
+    "transaction_id": "5e1b2390-...",
+    "idempotency_key": "unique-request-uuid-here",
+    "sender_id": "01a0c9f0-9252-71b9-a27c-d47a4eabbe34",
+    "receiver_id": "02b1d8e1-4567-89ab-cdef-0123456789ab",
+    "amount": "150.00",
+    "currency": "USD",
+    "status": "completed",
+    "created_at": "2026-09-22T17:35:00.000000Z"
+  }
+}
+```
+- **Error Responses**:
+  - `401 Unauthorized`: Missing `X-Signature` header.
+  - `403 Forbidden`: Invalid HMAC signature, or account inactive, or user does not own sender account.
+  - `404 Not Found`: Account ID not found.
+  - `409 Conflict`: Idempotency key reused with a different payload.
+    ```json
+    {
+      "status": "error",
+      "error": "IDEMPOTENCY_CONFLICT",
+      "message": "The idempotency key is already associated with a different request."
+    }
+    ```
+  - `422 Unprocessable Entity`: Insufficient funds, self-transfer, or invalid format.

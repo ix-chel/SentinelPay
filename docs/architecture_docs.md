@@ -1,45 +1,89 @@
-# SentinelPay Architecture
+# SentinelPay Architecture & Engineering Design
 
-This document provides a high-level overview of the SentinelPay payment system architecture.
+This document details the system architecture, concurrency control models, database integrity triggers, and security mechanisms of SentinelPay.
 
-## System Overview
+## 1. System Overview
 
-SentinelPay is a high-availability distributed payment API designed for financial integrity and transaction race-condition prevention.
+SentinelPay is a high-availability, security-oriented financial payment platform designed to prevent double-spending, race conditions, payload tampering, and ledger manipulation.
 
-### Core Components
-- **Laravel 12 API**: The main application interface serving RESTful endpoints.
-- **PostgreSQL**: The primary relational database enforcing ACID compliance and housing the immutable ledger.
-- **Redis**: In-memory data store used specifically for fast-path idempotency caching.
-- **RabbitMQ**: Message broker utilized for dispatching asynchronous post-transaction jobs (e.g., webhook notifications).
+### Technology Stack
+- **API Framework**: Laravel 12 on PHP 8.2+
+- **Relational Database**: PostgreSQL (ACID compliant with CHECK constraints & PL/pgSQL triggers)
+- **Token Authentication**: Laravel Sanctum with UUID morph support
+- **Payload Verification**: HMAC-SHA256 with timing-safe constant-time evaluation
+- **Caching**: File/Array cache for local development; Redis for multi-node deployments
+- **Message Pipeline**: Decoupled async job architecture (`TransactionNotificationJob`)
+- **Operations Console**: Vanilla ES module dashboard engine with Dark Liquid Glass Fintech design system
 
 ```mermaid
 graph TD
-    Client[Client] -->|HTTP Request| API[Laravel API]
-    API -->|HMAC Validation| Middleware[HMAC Middleware]
-    Middleware -->|Check Idempotency| Redis[(Redis)]
-    Middleware -->|Transact & Lock| DB[(PostgreSQL)]
-    DB --> |Write| Ledgers[Ledgers Table]
-    DB --> |Write| Accounts[Accounts Table]
-    API -->|Dispatch Job| RabbitMQ[RabbitMQ]
+    Client[Operator Browser / Dashboard / API Client] -->|HTTP / JSON| WebServer[Laravel 12 API]
+
+    subgraph Middleware & Security
+        WebServer --> RateLimiter[Throttle Middleware]
+        RateLimiter --> HmacCheck[VerifyHmacSignature]
+        RateLimiter --> SanctumAuth[Sanctum Guard]
+    end
+
+    subgraph Service Layer
+        HmacCheck --> TxController[TransactionController]
+        SanctumAuth --> TxController
+        SanctumAuth --> AuthController[AuthController]
+        TxController --> TransferService[TransferService]
+    end
+
+    subgraph Persistence & Integrity
+        TransferService --> Cache[(Fast-Path Idempotency Cache)]
+        TransferService -->|SELECT FOR UPDATE| PG[(PostgreSQL Database)]
+        PG --> Accounts[(accounts: balance >= 0)]
+        PG --> Transactions[(transactions: unique idempotency_key)]
+        PG --> Ledgers[(ledgers: append-only triggers)]
+    end
+
+    subgraph Asynchronous Queue
+        TransferService -->|Dispatch on Commit| Queue[TransactionNotificationJob]
+    end
 ```
 
-## Concurrency Control
+---
 
-SentinelPay uses **Pessimistic Row-Level Locking** to eliminate race conditions, double-spending, and deadlocks.
+## 2. Concurrency Control & Race Prevention
 
-1. **Deadlock Prevention**: When transferring funds between Account A and Account B, the system consistently sorts the UUIDs in memory before acquiring a database lock. This ensures lock acquisition order is deterministic.
-2. **`SELECT ... FOR UPDATE`**: The `Account` rows are locked exclusively for the duration of the database transaction. Concurrent requests attempting to mutate the same accounts will block until the active transaction completes or rolls back.
+SentinelPay uses **Pessimistic Row-Level Locking** to completely eliminate race conditions and double-spending.
 
-## Idempotency Mechanism
+### Deadlock-Free UUID Ordering
+When transferring funds between `sender` and `receiver`, concurrent requests moving in opposing directions (e.g., Alice $\rightarrow$ Bob and Bob $\rightarrow$ Alice) could deadlock if locks are acquired in arbitrary order. SentinelPay resolves this by sorting account UUIDs alphabetically before executing the database lock:
 
-To protect against network retries causing duplicate charges, SentinelPay implements a strict idempotency mechanism backed by Redis:
+```php
+$lockIds = [$senderAccountId, $receiverAccountId];
+sort($lockIds);
 
-1. **Fast-path via Redis**: Every transfer request involves an `idempotency_key`. The API checks Redis for this key. If found, the previously committed transaction is returned immediately without touching the PostgreSQL database.
-2. **Database constraints**: A unique index on `idempotency_key` exists in the `transactions` table.
-3. **TOCTOU Protection**: If two identical requests simultaneously bypass the Redis cache, PostgreSQL's `UNIQUE` constraint will force one transaction to fail. The exception is caught and correctly handled to prevent 500 errors, gracefully returning the winner's committed transaction.
+$accounts = Account::whereIn('id', $lockIds)
+    ->lockForUpdate()
+    ->get()
+    ->keyBy('id');
+```
 
-## Immutable Ledger
+The `SELECT ... FOR UPDATE` query establishes an exclusive row lock on both accounts. Any competing thread attempting to modify either account blocks until the current transaction commits or rolls back.
 
-Financial transactions require a strictly append-only audit trail. This is enforced at two layers:
-1. **Application Layer**: Overridden `update()` and `delete()` methods on the `Ledger` Eloquent model throw a `RuntimeException`.
-2. **Database Layer**: PostgreSQL triggers enforce `BEFORE UPDATE` and `BEFORE DELETE` to raise an exception, preventing DBA errors or direct SQL mutations.
+---
+
+## 3. Multi-Tier Idempotency & Conflict Resolution
+
+To protect against network retries causing duplicate debits, SentinelPay implements strict idempotency backed by PostgreSQL:
+
+1. **Fast-Path Cache**: The API first inspects the cache for the given `idempotency_key`. If present and the payload matches, the existing transaction is returned without touching the database.
+2. **PostgreSQL Source of Truth**: The `transactions` table enforces a database-level `UNIQUE (idempotency_key)` constraint.
+3. **Canonical Payload Fingerprinting**: To prevent silent reuse of an idempotency key with conflicting parameters (e.g. altering amount or recipient), `TransferService` computes a SHA-256 hash over canonical normalized fields (`amount`, `currency`, `sender_id`, `receiver_id`). Mismatched fingerprints throw `IdempotencyConflictException` and return `HTTP 409 Conflict`.
+4. **TOCTOU Race Handling**: If concurrent requests arrive simultaneously before cache warming occurs, PostgreSQL's unique constraint causes the duplicate to throw `UniqueConstraintViolationException`. SentinelPay intercepts this error, re-fetches the committed winner's transaction, validates the fingerprint, and gracefully returns the record without surfacing 500 errors.
+
+---
+
+## 4. Immutable Append-Only Ledger
+
+Financial integrity mandates that ledger records can never be mutated or erased. SentinelPay enforces this at two architectural layers:
+
+1. **Eloquent Model Guard (`app/Models/Ledger.php`)**:
+   `update()` and `delete()` methods throw `RuntimeException` on any attempt to modify ledger records via the application.
+2. **Database Trigger Guard (`ledgers` table)**:
+   A PL/pgSQL trigger function (`prevent_ledger_mutation()`) is bound to `BEFORE UPDATE` and `BEFORE DELETE` on the `ledgers` table, raising a PostgreSQL database exception if raw SQL or direct DBA updates are attempted.
