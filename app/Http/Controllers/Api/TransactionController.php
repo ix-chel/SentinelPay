@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Exceptions\AccountInactiveException;
 use App\Exceptions\AccountNotFoundException;
+use App\Exceptions\IdempotencyConflictException;
 use App\Exceptions\InsufficientFundsException;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\TransferRequest;
@@ -17,7 +18,8 @@ class TransactionController extends Controller
 {
     public function __construct(
         private readonly TransferService $transferService,
-    ) {}
+    ) {
+    }
 
     /**
      * POST /api/v1/transfers
@@ -26,6 +28,23 @@ class TransactionController extends Controller
     public function transfer(TransferRequest $request): JsonResponse
     {
         $validated = $request->validated();
+
+        // If an authenticated user is present (e.g. via Sanctum), enforce sender account ownership.
+        // Pure M2M HMAC-only requests remain supported without user tokens (full M2M binding deferred to Phase 3).
+        $user = $request->user() ?: auth('sanctum')->user();
+        if ($user) {
+            $senderAccount = Account::find($validated["sender_account_id"]);
+            if ($senderAccount && $senderAccount->user_id !== $user->id) {
+                return response()->json(
+                    [
+                        "status" => "error",
+                        "error" => "FORBIDDEN",
+                        "message" => "This account does not belong to you.",
+                    ],
+                    JsonResponse::HTTP_FORBIDDEN,
+                );
+            }
+        }
 
         // Read the raw signature from the header (already validated by HMAC middleware)
         $signature = $request->header("X-Signature");
@@ -56,6 +75,15 @@ class TransactionController extends Controller
                     ],
                 ],
                 JsonResponse::HTTP_CREATED,
+            );
+        } catch (IdempotencyConflictException $e) {
+            return response()->json(
+                [
+                    "status" => "error",
+                    "error" => "IDEMPOTENCY_CONFLICT",
+                    "message" => "The idempotency key is already associated with a different request.",
+                ],
+                JsonResponse::HTTP_CONFLICT,
             );
         } catch (InsufficientFundsException $e) {
             return response()->json(

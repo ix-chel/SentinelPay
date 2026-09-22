@@ -137,6 +137,159 @@ describe('TransferService', function () {
         ))->toThrow(\App\Exceptions\AccountInactiveException::class);
     });
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // Workstream 1: Idempotency Payload Fingerprinting Tests
+    // ──────────────────────────────────────────────────────────────────────────
+
+    it('rejects transfer when idempotency key is reused with different amount', function () {
+        $sender   = Account::factory()->withBalance(1000.00)->create(['currency' => 'USD']);
+        $receiver = Account::factory()->withBalance(0.00)->create(['currency' => 'USD']);
+        $service  = app(TransferService::class);
+        $key      = Str::uuid()->toString();
+
+        $service->transfer($sender->id, $receiver->id, '100.00', 'USD', $key, 'sig');
+
+        expect(fn () => $service->transfer(
+            $sender->id, $receiver->id, '150.00', 'USD', $key, 'sig'
+        ))->toThrow(\App\Exceptions\IdempotencyConflictException::class);
+    });
+
+    it('rejects transfer when idempotency key is reused with different sender', function () {
+        $sender1  = Account::factory()->withBalance(1000.00)->create(['currency' => 'USD']);
+        $sender2  = Account::factory()->withBalance(1000.00)->create(['currency' => 'USD']);
+        $receiver = Account::factory()->withBalance(0.00)->create(['currency' => 'USD']);
+        $service  = app(TransferService::class);
+        $key      = Str::uuid()->toString();
+
+        $service->transfer($sender1->id, $receiver->id, '100.00', 'USD', $key, 'sig');
+
+        expect(fn () => $service->transfer(
+            $sender2->id, $receiver->id, '100.00', 'USD', $key, 'sig'
+        ))->toThrow(\App\Exceptions\IdempotencyConflictException::class);
+    });
+
+    it('rejects transfer when idempotency key is reused with different receiver', function () {
+        $sender    = Account::factory()->withBalance(1000.00)->create(['currency' => 'USD']);
+        $receiver1 = Account::factory()->withBalance(0.00)->create(['currency' => 'USD']);
+        $receiver2 = Account::factory()->withBalance(0.00)->create(['currency' => 'USD']);
+        $service   = app(TransferService::class);
+        $key       = Str::uuid()->toString();
+
+        $service->transfer($sender->id, $receiver1->id, '100.00', 'USD', $key, 'sig');
+
+        expect(fn () => $service->transfer(
+            $sender->id, $receiver2->id, '100.00', 'USD', $key, 'sig'
+        ))->toThrow(\App\Exceptions\IdempotencyConflictException::class);
+    });
+
+    it('rejects transfer when idempotency key is reused with different currency', function () {
+        $sender   = Account::factory()->withBalance(1000.00)->create(['currency' => 'USD']);
+        $receiver = Account::factory()->withBalance(0.00)->create(['currency' => 'USD']);
+        $service  = app(TransferService::class);
+        $key      = Str::uuid()->toString();
+
+        $service->transfer($sender->id, $receiver->id, '100.00', 'USD', $key, 'sig');
+
+        expect(fn () => $service->transfer(
+            $sender->id, $receiver->id, '100.00', 'EUR', $key, 'sig'
+        ))->toThrow(\App\Exceptions\IdempotencyConflictException::class);
+    });
+
+    it('leaves original financial effect intact exactly once when conflicting idempotency attempt is rejected', function () {
+        $sender   = Account::factory()->withBalance(1000.00)->create(['currency' => 'USD']);
+        $receiver = Account::factory()->withBalance(0.00)->create(['currency' => 'USD']);
+        $service  = app(TransferService::class);
+        $key      = Str::uuid()->toString();
+
+        $txn1 = $service->transfer($sender->id, $receiver->id, '100.00', 'USD', $key, 'sig');
+
+        // Conflicting call with altered amount
+        try {
+            $service->transfer($sender->id, $receiver->id, '500.00', 'USD', $key, 'sig');
+        } catch (\App\Exceptions\IdempotencyConflictException) {
+            // expected
+        }
+
+        $sender->refresh();
+        $receiver->refresh();
+
+        expect((float) $sender->balance)->toBe(900.00)
+            ->and((float) $receiver->balance)->toBe(100.00)
+            ->and(Ledger::count())->toBe(2)
+            ->and(Transaction::count())->toBe(1);
+    });
+
+    it('produces identical payload fingerprint for semantically equivalent monetary representations', function () {
+        $service = app(TransferService::class);
+        $senderId = Str::uuid()->toString();
+        $receiverId = Str::uuid()->toString();
+
+        // 100 vs 100.00 vs 100.0
+        $hash1 = $service->calculatePayloadFingerprint($senderId, $receiverId, '100', 'USD');
+        $hash2 = $service->calculatePayloadFingerprint($senderId, $receiverId, '100.00', 'USD');
+        $hash3 = $service->calculatePayloadFingerprint($senderId, $receiverId, '100.0', 'usd');
+
+        expect($hash1)->toBe($hash2)
+            ->and($hash2)->toBe($hash3);
+    });
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Workstream 3: Mid-Transaction Failure Injection & Rollback
+    // ──────────────────────────────────────────────────────────────────────────
+
+    it('rolls back database mutations completely when failure is injected mid-transaction', function () {
+        $sender   = Account::factory()->withBalance(1000.00)->create(['currency' => 'USD']);
+        $receiver = Account::factory()->withBalance(500.00)->create(['currency' => 'USD']);
+        $key      = Str::uuid()->toString();
+        $service  = app(TransferService::class);
+
+        // Strictly test-scoped event listener on Ledger::creating to inject failure after partial writes
+        $listener = function (Ledger $ledger) {
+            if ($ledger->type === Ledger::TYPE_CREDIT) {
+                throw new \RuntimeException('Injected controlled mid-transaction failure');
+            }
+        };
+
+        Ledger::creating($listener);
+
+        try {
+            expect(function () use ($service, $sender, $receiver, $key) {
+                $service->transfer(
+                    senderAccountId:   $sender->id,
+                    receiverAccountId: $receiver->id,
+                    amount:            '100.00',
+                    currency:          'USD',
+                    idempotencyKey:    $key,
+                    signature:         'test-sig',
+                );
+            })->toThrow(\RuntimeException::class, 'Injected controlled mid-transaction failure');
+
+            $sender->refresh();
+            $receiver->refresh();
+
+            // Sender balance must be completely rolled back
+            expect((float) $sender->balance)->toBe(1000.00);
+
+            // Receiver balance must be completely rolled back
+            expect((float) $receiver->balance)->toBe(500.00);
+
+            // Transaction row must be rolled back
+            expect(Transaction::where('idempotency_key', $key)->exists())->toBeFalse();
+
+            // Ledger rows must be rolled back
+            expect(Ledger::count())->toBe(0);
+
+            // Cache must remain unpolluted
+            expect(Cache::has("idempotency:{$key}"))->toBeFalse();
+        } finally {
+            // Clean up: unbind test-scoped event listener so subsequent tests are unaffected
+            $dispatcher = Ledger::getEventDispatcher();
+            if ($dispatcher) {
+                $dispatcher->forget('eloquent.creating: App\Models\Ledger');
+            }
+        }
+    });
+
 });
 
 
@@ -149,9 +302,14 @@ describe('TransferService', function () {
 //   3. Exactly as many transfers succeed as the balance allows
 // ──────────────────────────────────────────────────────────────────────────────
 
-describe('Race Condition — Pessimistic Locking', function () {
+describe('Sequential Balance Protection & Overdraft Prevention', function () {
 
-    it('prevents double-spend when 10 concurrent processes transfer from the same account', function () {
+    /**
+     * NOTE: This test runs a sequential loop with unique idempotency keys.
+     * It validates balance integrity, overdraft prevention, and ledger consistency.
+     * True multi-process concurrency testing is handled separately in tests/Concurrent/ConcurrencyTest.php.
+     */
+    it('prevents overdraft and conserves balance across multiple sequential transfers from the same account', function () {
         // Setup: Sender starts with $1,000. Each transfer attempts to send $150.
         // Only 6 transfers should succeed (6 × $150 = $900 ≤ $1000), the 7th would overdraft.
         $initialBalance = '1000.00';
@@ -346,6 +504,45 @@ describe('HMAC Signature Middleware', function () {
             'X-Signature' => $signature,
         ])->assertStatus(201)
           ->assertJsonFragment(['status' => 'success']);
+    });
+
+    it('returns HTTP 409 Conflict when idempotency key is reused with different payload on API endpoint', function () {
+        $sender   = Account::factory()->withBalance(1000.00)->create(['currency' => 'USD']);
+        $receiver = Account::factory()->withBalance(0.00)->create(['currency' => 'USD']);
+        $key      = Str::uuid()->toString();
+
+        $payload1 = [
+            'sender_account_id'   => $sender->id,
+            'receiver_account_id' => $receiver->id,
+            'amount'              => '100.00',
+            'currency'            => 'USD',
+            'idempotency_key'     => $key,
+        ];
+        $secret    = config('sentinelpay.hmac_secret');
+        $signature1 = hash_hmac('sha256', json_encode($payload1), $secret);
+
+        $this->postJson('/api/v1/transfers', $payload1, [
+            'X-Signature' => $signature1,
+        ])->assertStatus(201);
+
+        // Second request with SAME key but DIFFERENT amount
+        $payload2 = [
+            'sender_account_id'   => $sender->id,
+            'receiver_account_id' => $receiver->id,
+            'amount'              => '200.00',
+            'currency'            => 'USD',
+            'idempotency_key'     => $key,
+        ];
+        $signature2 = hash_hmac('sha256', json_encode($payload2), $secret);
+
+        $this->postJson('/api/v1/transfers', $payload2, [
+            'X-Signature' => $signature2,
+        ])->assertStatus(409)
+          ->assertJsonFragment([
+              'status' => 'error',
+              'error'  => 'IDEMPOTENCY_CONFLICT',
+              'message' => 'The idempotency key is already associated with a different request.',
+          ]);
     });
 
 });

@@ -13,6 +13,7 @@ class Transaction extends Model
 
     protected $fillable = [
         'idempotency_key',
+        'payload_hash',
         'sender_id',
         'receiver_id',
         'amount',

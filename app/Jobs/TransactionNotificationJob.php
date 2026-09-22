@@ -19,9 +19,9 @@ use Illuminate\Support\Facades\Log;
  *  - POST to any registered webhooks
  *  - Publish an event to a downstream analytics pipeline
  *
- * By implementing ShouldQueue the job is pushed onto the configured queue
- * driver (RabbitMQ in production, sync in testing) so the HTTP response
- * is returned to the client immediately without waiting for delivery.
+ * By implementing ShouldQueue the job is dispatched to the configured queue
+ * driver (sync in local native development and testing, RabbitMQ in production cluster)
+ * so processing remains decoupled without requiring external brokers locally.
  */
 class TransactionNotificationJob implements ShouldQueue
 {

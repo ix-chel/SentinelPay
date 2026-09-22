@@ -452,4 +452,163 @@ describe("True Concurrency — proc_open Parallel Processes", function () {
             ]);
         },
     );
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test 3: 10 parallel processes, EXACT SAME idempotency key & payload
+    //
+    // Unlike Test 1 (which tests double-spend with unique idempotency keys),
+    // this exercises the PostgreSQL UNIQUE constraint race handling:
+    // 10 OS processes race to execute the exact same transfer simultaneously.
+    //
+    // Expected outcome:
+    //   • Financial effect = exactly one ($150 deducted once)
+    //   • Exactly 1 transaction row created in PostgreSQL
+    //   • Exactly 2 ledger entries created (1 debit, 1 credit)
+    //   • All processes resolve successfully and return the SAME transaction_id
+    //   • No unhandled process errors or crashes
+    //   • Sender final balance = $1,000 - $150 = $850
+    //   • Receiver final balance = $0 + $150 = $150
+    // ─────────────────────────────────────────────────────────────────────────
+
+    it(
+        "handles 10 concurrent processes with the exact same idempotency key and payload with exactly one financial effect",
+        function () {
+            if (!function_exists("proc_open")) {
+                $this->markTestSkipped(
+                    "proc_open is not available in this environment.",
+                );
+            }
+
+            $initialSenderBalance = "1000.00";
+            $initialReceiverBalance = "0.00";
+            $transferAmount = "150.00";
+            $concurrency = 10;
+            $sharedIdempotencyKey = "same-key-race-" . Str::uuid()->toString();
+
+            $sender = Account::factory()
+                ->withBalance($initialSenderBalance)
+                ->create(["currency" => "USD"]);
+            $receiver = Account::factory()
+                ->withBalance($initialReceiverBalance)
+                ->create(["currency" => "USD"]);
+
+            // ── Spawn all 10 processes simultaneously with identical key and payload ──
+            $spawned = [];
+            for ($i = 0; $i < $concurrency; $i++) {
+                $spawned[] = spawnTransferProcess(
+                    senderId: $sender->id,
+                    receiverId: $receiver->id,
+                    amount: $transferAmount,
+                    currency: "USD",
+                    idempotencyKey: $sharedIdempotencyKey,
+                );
+            }
+
+            // ── Collect all results ──
+            $results = [];
+            $successCount = 0;
+            $failCount = 0;
+            $errorCount = 0;
+            $transactionIds = [];
+
+            foreach ($spawned as $proc) {
+                $result = collectProcessResult($proc);
+                $results[] = $result;
+
+                if ($result["status"] === "success") {
+                    $successCount++;
+                    if (!empty($result["parsed"]["transaction_id"])) {
+                        $transactionIds[] = $result["parsed"]["transaction_id"];
+                    }
+                } elseif ($result["status"] === "failed") {
+                    $failCount++;
+                } else {
+                    $errorCount++;
+                }
+            }
+
+            // ── Assert: no unexpected crashes ──
+            $errorDetails = array_filter(
+                $results,
+                fn($r) => $r["status"] === "error",
+            );
+            expect($errorCount)->toBe(
+                0,
+                implode(
+                    "\n",
+                    array_map(
+                        fn(
+                            $r,
+                        ) => "Process error [{$r["key"]}]: stdout={$r["stdout"]} stderr={$r["stderr"]}",
+                        $errorDetails,
+                    ),
+                ),
+            );
+
+            // ── Assert: all successes returned the EXACT SAME transaction ID ──
+            $uniqueTransactionIds = array_unique($transactionIds);
+            expect(count($uniqueTransactionIds))->toBe(1);
+            expect($successCount)->toBe($concurrency);
+
+            // ── Assert: financial integrity ──
+            $sender->refresh();
+            $receiver->refresh();
+
+            $finalSenderBalance = bcadd((string) $sender->balance, "0", 2);
+            $finalReceiverBalance = bcadd((string) $receiver->balance, "0", 2);
+
+            // 1. Sender debited exactly once
+            $expectedSenderBalance = bcsub(
+                $initialSenderBalance,
+                $transferAmount,
+                2,
+            );
+            expect($finalSenderBalance)->toBe(
+                $expectedSenderBalance,
+                "Sender balance mismatch: expected {$expectedSenderBalance}, got {$finalSenderBalance}",
+            );
+
+            // 2. Receiver credited exactly once
+            expect($finalReceiverBalance)->toBe(
+                $transferAmount,
+                "Receiver balance mismatch: expected {$transferAmount}, got {$finalReceiverBalance}",
+            );
+
+            // 3. Exactly 1 transaction row exists in PostgreSQL
+            $dbTxnCount = Transaction::where(
+                "idempotency_key",
+                $sharedIdempotencyKey,
+            )->count();
+            expect($dbTxnCount)->toBe(
+                1,
+                "Expected exactly 1 transaction record in DB, got {$dbTxnCount}",
+            );
+
+            // 4. Exactly 2 ledger rows exist in PostgreSQL (1 debit, 1 credit)
+            $ledgerCount = Ledger::count();
+            expect($ledgerCount)->toBe(
+                2,
+                "Expected exactly 2 ledger entries, got {$ledgerCount}",
+            );
+
+            // 5. Zero stuck transactions
+            $stuckCount = Transaction::whereIn("status", [
+                Transaction::STATUS_PENDING,
+                Transaction::STATUS_PROCESSING,
+            ])->count();
+            expect($stuckCount)->toBe(0);
+
+            dump([
+                "scenario" => "Same-Key Concurrency Race",
+                "concurrent_processes" => $concurrency,
+                "shared_idempotency_key" => $sharedIdempotencyKey,
+                "success_count" => $successCount,
+                "unique_transaction_ids" => count($uniqueTransactionIds),
+                "sender_balance" => $finalSenderBalance,
+                "receiver_balance" => $finalReceiverBalance,
+                "db_transactions" => $dbTxnCount,
+                "db_ledgers" => $ledgerCount,
+            ]);
+        },
+    );
 });

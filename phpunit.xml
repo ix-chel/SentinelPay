@@ -33,13 +33,12 @@
         <env name="DB_PORT" value="5432" force="false"/>
         <env name="DB_DATABASE" value="sentinelpay_test" force="false"/>
         <env name="DB_USERNAME" value="postgres" force="false"/>
-        <env name="DB_PASSWORD" value="postgres" force="false"/>
+        <env name="DB_PASSWORD" value="postgre" force="false"/>
         <env name="MAIL_MAILER" value="array" force="false"/>
         <env name="QUEUE_CONNECTION" value="sync" force="false"/>
         <env name="SESSION_DRIVER" value="array" force="false"/>
-        <env name="REDIS_CLIENT" value="phpredis" force="false"/>
-        <env name="REDIS_HOST" value="127.0.0.1" force="false"/>
-        <env name="REDIS_PASSWORD" value="secret" force="false"/>
+        <!-- Redis is deferred infrastructure: not required for test suite execution -->
+        <!-- <env name="REDIS_CLIENT" value="phpredis" force="false"/> -->
         <!-- HMAC secret for security tests -->
         <env name="HMAC_SECRET" value="test-hmac-secret-key-for-phpunit" force="false"/>
         <env name="PULSE_ENABLED" value="false" force="false"/>

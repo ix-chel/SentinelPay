@@ -4,6 +4,7 @@ namespace App\Console\Commands;
 
 use App\Exceptions\AccountInactiveException;
 use App\Exceptions\AccountNotFoundException;
+use App\Exceptions\IdempotencyConflictException;
 use App\Exceptions\InsufficientFundsException;
 use App\Services\TransferService;
 use Illuminate\Console\Command;
@@ -93,6 +94,15 @@ class TestTransferCommand extends Command
             $this->line(json_encode([
                 'status' => 'failed',
                 'reason' => 'account_not_found',
+                'detail' => $e->getMessage(),
+            ]));
+
+            return self::FAILURE;
+
+        } catch (IdempotencyConflictException $e) {
+            $this->line(json_encode([
+                'status' => 'failed',
+                'reason' => 'idempotency_conflict',
                 'detail' => $e->getMessage(),
             ]));
 

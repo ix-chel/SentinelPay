@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Exceptions\AccountInactiveException;
 use App\Exceptions\AccountNotFoundException;
+use App\Exceptions\IdempotencyConflictException;
 use App\Exceptions\InsufficientFundsException;
 use App\Jobs\TransactionNotificationJob;
 use App\Models\Account;
@@ -17,17 +18,16 @@ use Illuminate\Support\Facades\Log;
 class TransferService
 {
     /**
-     * The Redis TTL for idempotency keys (24 hours).
-     * After this period, a repeated key will be processed again.
+     * Cache TTL for idempotency keys (24 hours).
      */
     private const IDEMPOTENCY_TTL_SECONDS = 86400;
 
     /**
      * Execute a funds transfer with:
-     *  1. Redis-based idempotency check (prevents double-charging on retries)
+     *  1. PostgreSQL-backed idempotency verification (Cache acceleration + DB uniqueness)
      *  2. PostgreSQL pessimistic locking (eliminates race conditions / overdrafts)
      *  3. Append-only ledger entries (immutable audit trail)
-     *  4. Async notification dispatch (RabbitMQ in production, sync in tests)
+     *  4. Async notification dispatch (sync in local dev/tests, broker in multi-node)
      *
      * @throws \App\Exceptions\InsufficientFundsException
      * @throws \App\Exceptions\AccountInactiveException
@@ -43,42 +43,101 @@ class TransferService
         string $signature,
     ): Transaction {
         // ──────────────────────────────────────────────────────────────────────
-        // Step 1: Idempotency Check (Redis fast-path)
+        // Step 1: Idempotency Check (Fast-path Cache + PostgreSQL Source of Truth)
         //
-        // If we have already processed this key and cached the result, return
-        // the existing transaction immediately without touching the database.
-        // This protects against double-charging caused by network retries,
-        // client crashes, or duplicate webhook deliveries.
+        // Invariant: same idempotency key → same transaction → never double-charge.
+        // PostgreSQL's unique constraint on `idempotency_key` is the authoritative
+        // source of truth. The cache layer (Redis in cluster, file/array locally)
+        // serves purely as an acceleration read-path.
         // ──────────────────────────────────────────────────────────────────────
+        $payloadHash = $this->calculatePayloadFingerprint(
+            $senderAccountId,
+            $receiverAccountId,
+            $amount,
+            $currency,
+        );
+
         $cacheKey = "idempotency:{$idempotencyKey}";
 
         $cachedTransactionId = Cache::get($cacheKey);
 
         if ($cachedTransactionId !== null) {
-            Log::info(
-                "[Transfer] Idempotency cache hit — returning existing transaction.",
-                [
-                    "idempotency_key" => $idempotencyKey,
-                    "transaction_id" => $cachedTransactionId,
-                ],
-            );
-
             $transaction = Transaction::find($cachedTransactionId);
 
             if ($transaction) {
+                $existingHash = $transaction->payload_hash ?? $this->calculatePayloadFingerprint(
+                    $transaction->sender_id,
+                    $transaction->receiver_id,
+                    (string) $transaction->amount,
+                    $transaction->currency,
+                );
+
+                if ($existingHash !== $payloadHash) {
+                    Log::warning(
+                        "[Transfer] Idempotency conflict detected in cache — payload mismatch.",
+                        [
+                            "idempotency_key" => $idempotencyKey,
+                            "cached_transaction_id" => $transaction->id,
+                        ],
+                    );
+                    throw new IdempotencyConflictException(
+                        "Idempotency key '{$idempotencyKey}' has already been used with a different request payload.",
+                    );
+                }
+
+                Log::info(
+                    "[Transfer] Idempotency cache hit — returning existing transaction.",
+                    [
+                        "idempotency_key" => $idempotencyKey,
+                        "transaction_id" => $cachedTransactionId,
+                    ],
+                );
+
                 return $transaction;
             }
 
-            // Cache entry exists but the row is gone (e.g. manual DB cleanup).
-            // Fall through and let the transfer proceed normally.
             Log::warning(
-                "[Transfer] Idempotency cache pointed to a missing transaction — reprocessing.",
+                "[Transfer] Idempotency cache pointed to a missing transaction — checking database.",
                 [
                     "idempotency_key" => $idempotencyKey,
                     "cached_id" => $cachedTransactionId,
                 ],
             );
             Cache::forget($cacheKey);
+        }
+
+        // Database source-of-truth check for idempotency
+        $existingTransaction = Transaction::where("idempotency_key", $idempotencyKey)->first();
+        if ($existingTransaction) {
+            $existingHash = $existingTransaction->payload_hash ?? $this->calculatePayloadFingerprint(
+                $existingTransaction->sender_id,
+                $existingTransaction->receiver_id,
+                (string) $existingTransaction->amount,
+                $existingTransaction->currency,
+            );
+
+            if ($existingHash !== $payloadHash) {
+                Log::warning(
+                    "[Transfer] Idempotency conflict detected in database — payload mismatch.",
+                    [
+                        "idempotency_key" => $idempotencyKey,
+                        "transaction_id" => $existingTransaction->id,
+                    ],
+                );
+                throw new IdempotencyConflictException(
+                    "Idempotency key '{$idempotencyKey}' has already been used with a different request payload.",
+                );
+            }
+
+            Log::info(
+                "[Transfer] PostgreSQL idempotency hit — returning existing transaction.",
+                [
+                    "idempotency_key" => $idempotencyKey,
+                    "transaction_id" => $existingTransaction->id,
+                ],
+            );
+            Cache::put($cacheKey, $existingTransaction->id, self::IDEMPOTENCY_TTL_SECONDS);
+            return $existingTransaction;
         }
 
         // ──────────────────────────────────────────────────────────────────────
@@ -98,6 +157,7 @@ class TransferService
                 $currency,
                 $idempotencyKey,
                 $signature,
+                $payloadHash,
             ): Transaction {
                 // Sort both UUIDs before locking to guarantee a consistent
                 // acquisition order regardless of which direction the transfer
@@ -155,6 +215,7 @@ class TransferService
                 // silently disappearing.
                 $transaction = Transaction::create([
                     "idempotency_key" => $idempotencyKey,
+                    "payload_hash" => $payloadHash,
                     "sender_id" => $senderAccountId,
                     "receiver_id" => $receiverAccountId,
                     "amount" => $amountDecimal,
@@ -233,6 +294,26 @@ class TransferService
                 $idempotencyKey,
             )->firstOrFail();
 
+            $existingHash = $transaction->payload_hash ?? $this->calculatePayloadFingerprint(
+                $transaction->sender_id,
+                $transaction->receiver_id,
+                (string) $transaction->amount,
+                $transaction->currency,
+            );
+
+            if ($existingHash !== $payloadHash) {
+                Log::warning(
+                    "[Transfer] Idempotency conflict detected in TOCTOU race — payload mismatch.",
+                    [
+                        "idempotency_key" => $idempotencyKey,
+                        "transaction_id" => $transaction->id,
+                    ],
+                );
+                throw new IdempotencyConflictException(
+                    "Idempotency key '{$idempotencyKey}' has already been used with a different request payload.",
+                );
+            }
+
             // Warm the cache so subsequent requests skip this path entirely.
             Cache::put(
                 $cacheKey,
@@ -244,7 +325,7 @@ class TransferService
         }
 
         // ──────────────────────────────────────────────────────────────────────
-        // Step 3: Cache idempotency key → transaction ID (Redis)
+        // Step 3: Cache idempotency key → transaction ID
         //
         // Stored AFTER the DB transaction commits so that if the app crashes
         // between commit and here, the next request falls through to the DB
@@ -263,5 +344,36 @@ class TransferService
         TransactionNotificationJob::dispatch($transaction->id);
 
         return $transaction;
+    }
+
+    /**
+     * Compute a deterministic SHA-256 fingerprint for financially relevant transfer parameters.
+     *
+     * Canonicalization rules:
+     * - amount: normalized to 2 decimal places using bcadd($amount, '0', 2)
+     * - currency: uppercase and trimmed
+     * - sender_id and receiver_id: string UUIDs
+     * - keys sorted alphabetically to guarantee stable JSON representation
+     */
+    public function calculatePayloadFingerprint(
+        string $senderAccountId,
+        string $receiverAccountId,
+        string $amount,
+        string $currency,
+    ): string {
+        $normalizedAmount = bcadd($amount, "0", 2);
+        $normalizedCurrency = strtoupper(trim($currency));
+
+        $payload = [
+            "amount" => $normalizedAmount,
+            "currency" => $normalizedCurrency,
+            "receiver_id" => $receiverAccountId,
+            "sender_id" => $senderAccountId,
+        ];
+        ksort($payload);
+
+        $canonicalString = json_encode($payload, JSON_THROW_ON_ERROR);
+
+        return hash("sha256", $canonicalString);
     }
 }
