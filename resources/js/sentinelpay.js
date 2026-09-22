@@ -247,21 +247,29 @@ function logout() {
 
 /* ─── Account Loading ─────────────────────────────────────────────────────── */
 async function loadAccounts() {
-    // We try sequential IDs 1–20 to discover accounts belonging to the user.
-    // The API will 403 for accounts that don't belong to the user.
-    const discovered = [];
-    for (let i = 1; i <= 20; i++) {
-        try {
-            const data = await apiFetch(`/accounts/${i}/balance`, { auth: true });
-            if (data.data) {
-                discovered.push({ id: data.data.account_id, balance: data.data.balance, currency: data.data.currency, is_active: data.data.is_active });
-            }
-        } catch (err) {
-            if (err.status === 403 || err.status === 401) continue;
-            if (err.status === 404) continue;
-            break; // network error — stop
+    let discovered = [];
+    try {
+        const res = await apiFetch('/accounts', { auth: true });
+        if (res.data && Array.isArray(res.data)) {
+            discovered = res.data.map(a => ({
+                id: a.id,
+                balance: a.balance,
+                currency: a.currency,
+                is_active: a.is_active,
+            }));
+        }
+    } catch (err) {
+        console.warn('Failed to load accounts via /accounts endpoint, checking session user:', err);
+        if (state.user?.accounts && Array.isArray(state.user.accounts)) {
+            discovered = state.user.accounts.map(a => ({
+                id: a.id,
+                balance: a.balance,
+                currency: a.currency,
+                is_active: a.is_active,
+            }));
         }
     }
+
     state.accounts = discovered;
 
     populateAccountSelectors();

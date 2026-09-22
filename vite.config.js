@@ -7,10 +7,16 @@ export default defineConfig({
         laravel({
             input: ['resources/css/app.css', 'resources/js/app.js'],
             refresh: true,
+            detectTls: false,
         }),
         tailwindcss(),
     ],
     server: {
+        host: 'localhost',
+        cors: true,
+        hmr: {
+            host: 'localhost',
+        },
         watch: {
             ignored: ['**/storage/framework/views/**'],
         },

@@ -213,4 +213,38 @@ describe('Account Authorization & Ownership Boundaries', function () {
             ]);
     });
 
+    it('allows owner to list all their accounts via GET /api/v1/accounts', function () {
+        $user = User::factory()->create();
+        $otherUser = User::factory()->create();
+
+        $account1 = Account::factory()->withBalance('1000.00')->create([
+            'user_id'  => $user->id,
+            'currency' => 'USD',
+        ]);
+        $account2 = Account::factory()->withBalance('500.00')->create([
+            'user_id'  => $user->id,
+            'currency' => 'EUR',
+        ]);
+        $otherAccount = Account::factory()->withBalance('9999.00')->create([
+            'user_id'  => $otherUser->id,
+            'currency' => 'USD',
+        ]);
+
+        $token = $user->createToken('test-token')->plainTextToken;
+
+        $response = $this->withHeader('Authorization', "Bearer {$token}")
+            ->getJson('/api/v1/accounts');
+
+        $response->assertStatus(200)
+            ->assertJson([
+                'status' => 'success',
+            ]);
+
+        $accountIds = collect($response->json('data'))->pluck('id');
+        expect($accountIds)->toContain($account1->id);
+        expect($accountIds)->toContain($account2->id);
+        expect($accountIds)->not->toContain($otherAccount->id);
+    });
+
 });
+

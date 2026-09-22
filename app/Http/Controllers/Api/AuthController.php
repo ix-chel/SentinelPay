@@ -41,6 +41,8 @@ class AuthController extends Controller
         $user  = Auth::user();
         $token = $user->createToken('api-token')->plainTextToken;
 
+        $accounts = $user->accounts()->get(['id', 'balance', 'currency', 'is_active']);
+
         return response()->json([
             'status'  => 'success',
             'message' => 'Authenticated successfully.',
@@ -48,9 +50,10 @@ class AuthController extends Controller
                 'token'      => $token,
                 'token_type' => 'Bearer',
                 'user'       => [
-                    'id'    => $user->id,
-                    'name'  => $user->name,
-                    'email' => $user->email,
+                    'id'       => $user->id,
+                    'name'     => $user->name,
+                    'email'    => $user->email,
+                    'accounts' => $accounts,
                 ],
             ],
         ]);

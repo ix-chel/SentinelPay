@@ -140,6 +140,24 @@ class TransactionController extends Controller
     }
 
     /**
+     * GET /api/v1/accounts
+     *
+     * Returns all accounts belonging to the authenticated user.
+     *
+     * Requires:  Authorization: Bearer <sanctum-token>
+     */
+    public function index(Request $request): JsonResponse
+    {
+        $accounts = $request->user()->accounts()
+            ->get(['id', 'balance', 'currency', 'is_active', 'created_at']);
+
+        return response()->json([
+            "status" => "success",
+            "data" => $accounts,
+        ]);
+    }
+
+    /**
      * GET /api/v1/accounts/{account}/balance
      *
      * Returns the current balance for the given account.

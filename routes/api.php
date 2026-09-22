@@ -65,6 +65,10 @@ Route::prefix("v1")->group(function () {
     // The controller additionally checks account->user_id === auth()->id() as
     // a second line of defence against horizontal privilege escalation.
     Route::middleware(["auth:sanctum", "throttle:60,1"])->group(function () {
+        Route::get("/accounts", [
+            TransactionController::class,
+            "index",
+        ]);
         Route::get("/accounts/{account}/balance", [
             TransactionController::class,
             "balance",
