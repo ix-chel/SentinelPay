@@ -10,23 +10,23 @@ This diagram is based on the current repository routes, controllers, transfer se
 flowchart TB
   subgraph CLIENT["CLIENT / OPERATIONS CONSOLE"]
     BROWSER["Operator browser"]
-    DASH["Dashboard UI\nBlade view + JavaScript entry"]
+    DASH["Dashboard UI<br/>Blade view + JavaScript entry"]
     BROWSER --> DASH
   end
 
   subgraph API["LARAVEL 12 API"]
-    ROUTES["API routes\n/api/v1/*"]
+    ROUTES["API routes<br/>/api/v1/*"]
     HEALTH["GET /health"]
-    LOGIN["POST /auth/login\nrate limited"]
-    LOGOUT["POST /auth/logout\nSanctum + rate limit"]
-    READ["Account read endpoints\n/accounts, balance, transactions"]
-    SANCTUM["Laravel Sanctum\nBearer token + account ownership checks"]
+    LOGIN["POST /auth/login<br/>rate limited"]
+    LOGOUT["POST /auth/logout<br/>Sanctum + rate limit"]
+    READ["Account read endpoints<br/>/accounts, balance, transactions"]
+    SANCTUM["Laravel Sanctum<br/>Bearer token + account ownership checks"]
     TRANSFER["POST /transfers"]
-    HMAC["VerifyHmacSignature\nX-Signature · HMAC-SHA256"]
-    THROTTLE["Transfer rate limit\n30 requests/minute"]
-    VALIDATE["TransferRequest\nValidated request payload"]
+    HMAC["VerifyHmacSignature<br/>X-Signature · HMAC-SHA256"]
+    THROTTLE["Transfer rate limit<br/>30 requests/minute"]
+    VALIDATE["TransferRequest<br/>Validated request payload"]
     CONTROLLER["TransactionController"]
-    SERVICE["TransferService\nAtomic transfer orchestration"]
+    SERVICE["TransferService<br/>Atomic transfer orchestration"]
 
     ROUTES --> HEALTH
     ROUTES --> LOGIN
@@ -37,20 +37,20 @@ flowchart TB
   end
 
   subgraph IDEMPOTENCY["IDEMPOTENCY LAYER"]
-    CACHE["Cache accelerator\nFile/array locally; Redis for clustered deployment"]
-    KEY["Canonical payload fingerprint\nSHA-256"]
-    UNIQUE["PostgreSQL unique idempotency key\nAuthoritative source of truth"]
+    CACHE["Cache accelerator<br/>File/array locally; Redis for clustered deployment"]
+    KEY["Canonical payload fingerprint<br/>SHA-256"]
+    UNIQUE["PostgreSQL unique idempotency key<br/>Authoritative source of truth"]
   end
 
   subgraph DB["SUPABASE POSTGRESQL"]
-    ACC["accounts\nBalance constraint; active state; currency"]
-    TX["transactions\nUnique idempotency_key + payload_hash"]
-    LEDGER["ledgers\nDebit/credit audit trail\nAppend-only trigger protection"]
+    ACC["accounts<br/>Balance constraint; active state; currency"]
+    TX["transactions<br/>Unique idempotency_key + payload_hash"]
+    LEDGER["ledgers<br/>Debit/credit audit trail<br/>Append-only trigger protection"]
   end
 
   subgraph JOBS["POST-TRANSFER NOTIFICATION"]
     JOB["TransactionNotificationJob"]
-    BROKER["Queue driver\nSync locally/tests; RabbitMQ configured for async deployment"]
+    BROKER["Queue driver<br/>Sync locally/tests; RabbitMQ configured for async deployment"]
     JOB --> BROKER
   end
 
@@ -59,7 +59,7 @@ flowchart TB
   SERVICE <--> CACHE
   SERVICE --> UNIQUE
   UNIQUE --> TX
-  SERVICE -->|"SELECT FOR UPDATE\nUUIDs sorted before lock"| ACC
+  SERVICE -->|"SELECT FOR UPDATE<br/>UUIDs sorted before lock"| ACC
   SERVICE -->|"same DB transaction"| TX
   SERVICE -->|"debit + credit entries"| LEDGER
   SERVICE -->|"dispatch after commit"| JOB
@@ -80,29 +80,29 @@ flowchart TB
 
 ```mermaid
 flowchart TD
-  START["Client submits POST /api/v1/transfers"] --> SIGN["Verify X-Signature\nHMAC-SHA256 + hash_equals"]
+  START["Client submits POST /api/v1/transfers"] --> SIGN["Verify X-Signature<br/>HMAC-SHA256 + hash_equals"]
   SIGN --> SIGOK{"Signature valid?"}
-  SIGOK -- "No" --> REJECT["Reject request\nMissing: 401 · Invalid: 403"]
+  SIGOK -- "No" --> REJECT["Reject request<br/>Missing: 401 · Invalid: 403"]
   SIGOK -- "Yes" --> RATE["Apply transfer rate limit"]
   RATE --> VALID["TransferRequest validates fields"]
-  VALID --> IDEM["Calculate canonical payload hash\nCheck cache, then PostgreSQL"]
+  VALID --> IDEM["Calculate canonical payload hash<br/>Check cache, then PostgreSQL"]
   IDEM --> EXIST{"Idempotency key exists?"}
-  EXIST -- "Same payload" --> REPLAY["Return existing transaction\nNo second debit"]
-  EXIST -- "Different payload" --> CONFLICT["HTTP 409\nIdempotency conflict"]
+  EXIST -- "Same payload" --> REPLAY["Return existing transaction<br/>No second debit"]
+  EXIST -- "Different payload" --> CONFLICT["HTTP 409<br/>Idempotency conflict"]
   EXIST -- "No" --> BEGIN["Begin database transaction"]
-  BEGIN --> LOCK["Lock sender + receiver rows\nSELECT FOR UPDATE in sorted UUID order"]
-  LOCK --> CHECK{"Accounts active, currencies match,\nfunds sufficient?"}
-  CHECK -- "No" --> ROLLBACK["Rollback transaction\nReturn domain error"]
+  BEGIN --> LOCK["Lock sender + receiver rows<br/>SELECT FOR UPDATE in sorted UUID order"]
+  LOCK --> CHECK{"Accounts active, currencies match,<br/>funds sufficient?"}
+  CHECK -- "No" --> ROLLBACK["Rollback transaction<br/>Return domain error"]
   CHECK -- "Yes" --> CREATE["Create processing transaction record"]
-  CREATE --> DEBIT["Debit sender balance\nAppend DEBIT ledger entry"]
-  DEBIT --> CREDIT["Credit receiver balance\nAppend CREDIT ledger entry"]
+  CREATE --> DEBIT["Debit sender balance<br/>Append DEBIT ledger entry"]
+  DEBIT --> CREDIT["Credit receiver balance<br/>Append CREDIT ledger entry"]
   CREDIT --> COMPLETE["Mark transaction completed"]
   COMPLETE --> COMMIT["Commit atomically"]
   COMMIT --> CACHE["Warm idempotency cache"]
   CACHE --> NOTIFY["Dispatch TransactionNotificationJob"]
   NOTIFY --> SUCCESS["Return HTTP 201"]
   
-  DBGUARD["Database guarantees:\nunique idempotency key · balance constraint\nledger UPDATE/DELETE blocked by trigger"]
+  DBGUARD["Database guarantees:<br/>unique idempotency key · balance constraint<br/>ledger UPDATE/DELETE blocked by trigger"]
   DBGUARD -. "enforces invariants" .-> BEGIN
   DBGUARD -. "protects records" .-> DEBIT
 
